@@ -218,7 +218,7 @@ persistent actor {
   private func escapeGuestNote(note : Text) : ?Text {
     var out = "";
     for (ch in note.chars()) {
-      if (ch == '"') { out := out # "\\\"" }
+      if (ch == '\"') { out := out # "\\\"" }
       else if (ch == '\\') { out := out # "\\\\" }
       else if (ch == '\n') { out := out # "\\n" }
       else if (ch == '\r') { out := out # "\\r" }
