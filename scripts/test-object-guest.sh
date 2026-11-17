@@ -22,6 +22,15 @@ track="$(dfx canister call backend createTrack \
   })')"
 echo "$track" | grep -q 'ok'
 
+# Duplicate public object IDs must not allow QR shadowing.
+dfx canister call backend createTrack \
+  '(record { id = "obj-11111111-1111-4111-8111-111111111111"; name = "Hijack";
+    description = "alltracks:object:v1:{}"; length = 0.0; elevation = 0.0;
+    duration = 0.0; startime = 1760000000000000000; isPublic = true;
+    groupId = null; trackfile = record {fileType = "object"; url = ""};
+    startPoint = record {latitude = 0.0; longitude = 0.0}; trackType = variant {other}
+  })' | grep -q 'Object ID already exists'
+
 dfx canister call backend getObjectGuestPolicy "(\"$object_id\")" --query | grep -q 'null'
 
 not_owner="$(dfx --identity unrelated canister call backend setObjectGuestPolicy \
@@ -55,6 +64,19 @@ echo "$readback" | grep -q 'createdBy'
 
 repeat="$(dfx --identity guest-relay canister call backend submitGuestCheckin "$payload")"
 echo "$repeat" | grep -q 'duplicate'
+
+# A fresh request for the same object within 30 seconds hits the quota gap.
+gap_payload="$(printf '%s' "$payload" | sed 's/22222222-2222-4222-8222-222222222222/44444444-4444-4444-8444-444444444444/')"
+gap="$(dfx --identity guest-relay canister call backend submitGuestCheckin "$gap_payload")"
+echo "$gap" | grep -q 'rateLimited'
+
+# Ordinary anonymous Checkpoint writes must remain rejected.
+anon_cp="$(dfx --identity anonymous canister call backend createCheckpoint   '(record {
+    trackId = "obj-11111111-1111-4111-8111-111111111111";
+    latitude = 49.1; longitude = -122.6; elevation = 0.0; note = "forged";
+    groupId = null; photo = null; timestamp = 1760000000000000000; isPublic = true
+  })')"
+echo "$anon_cp" | grep -q 'Anonymous users are not allowed'
 
 invalid="$(dfx --identity guest-relay canister call backend submitGuestCheckin \
   '(record {
