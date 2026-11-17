@@ -1,0 +1,22 @@
+name: Backend CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  motoko:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dfx
+        uses: dfinity/setup-dfx@main
+        with:
+          dfx-version: '0.30.2'
+      - name: Compile existing AllTracks Motoko canister
+        run: |
+          dfx start --background --clean
+          dfx canister create backend
+          dfx build backend
+      - name: Test guest object ACL, replay and upgrade persistence
+        run: bash scripts/test-object-guest.sh
