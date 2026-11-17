@@ -12,6 +12,7 @@ import Result "mo:base/Result";
 import Random "mo:base/Random";
 import Float "mo:base/Float";
 import Blob "mo:base/Blob";
+import Char "mo:base/Char";
 import Nat8 "mo:base/Nat8";
 
 import HashMap "mo:base/HashMap";
@@ -34,6 +35,11 @@ persistent actor {
   private  var checkpoints : List.List<Types.CheckPoint> = List.nil();
   private  var incidentPoints : List.List<Types.IncidentPoint> = List.nil();
   private  var userCredentialsEntries : [(Principal, Types.UserCredential)] = [];
+  // Additive stable fields: compatible with the existing Track/Checkpoint model.
+  private var objectGuestPolicies : [(Text, Principal, Bool)] = [];
+  private var guestRequestReceipts : [(Text, Text, Int)] = [];
+  private var guestDailyUsage : [(Text, Int, Nat, Int)] = [];
+
 
   private transient var userCredentials = HashMap.HashMap<Principal, Types.UserCredential>(1, Principal.equal, Principal.hash);
 
@@ -120,6 +126,197 @@ persistent actor {
       nextSpotId := id;
     };
 
+  };
+
+
+  // Object guest check-ins are owner-opted-in, gateway-only and bounded.
+  // They reuse the existing CheckPoint store and DO NOT weaken createCheckpoint.
+  public type GuestAction = { #found; #carried; #left };
+  public type GuestCheckinInput = {
+    objectId : Text;
+    latitude : Float;
+    longitude : Float;
+    accuracyMeters : Nat;
+    action : GuestAction;
+    note : Text;
+    requestId : Text;
+  };
+  public type GuestCheckinError = {
+    #unauthorized;
+    #notFound;
+    #disabled;
+    #invalid;
+    #duplicate;
+    #rateLimited;
+  };
+  private let guestDailyLimit : Nat = 30;
+  private let guestMinimumGapNs : Int = 30_000_000_000;
+  private let guestDayNs : Int = 86_400_000_000_000;
+  private let guestMaxReceipts : Nat = 3000;
+  private let guestMaxPolicies : Nat = 5000;
+  private let objectMetadataPrefix = "alltracks:object:v1:";
+  private let guestCheckpointPrefix = "alltracks:object-checkin:v1:";
+
+  private func objectTrack(id : Text) : ?Types.Track {
+    if (not Text.startsWith(id, #text "obj-")) return null;
+    switch (List.find<Types.Track>(tracks, func(t) { t.id == id })) {
+      case (?track) {
+        if (track.isPublic and track.trackType == #other and
+            Text.startsWith(track.description, #text objectMetadataPrefix)) {
+          ?track
+        } else { null }
+      };
+      case null { null };
+    }
+  };
+
+  private func guestPolicy(id : Text) : ?(Principal, Bool) {
+    for ((storedId, gateway, enabled) in objectGuestPolicies.vals()) {
+      if (storedId == id) return ?(gateway, enabled);
+    };
+    null
+  };
+
+  public query func getObjectGuestPolicy(objectId : Text) : async ?{
+    enabled : Bool;
+    gateway : Principal;
+  } {
+    switch (objectTrack(objectId), guestPolicy(objectId)) {
+      case (?_, ?(gateway, enabled)) { ?{ enabled; gateway } };
+      case _ { null };
+    }
+  };
+
+  public shared ({ caller }) func setObjectGuestPolicy(
+    objectId : Text, enabled : Bool, gateway : Principal
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only owner may change guest policy");
+      };
+    };
+    if (enabled and Principal.isAnonymous(gateway)) return #err("Gateway may not be anonymous");
+    if (guestPolicy(objectId) == null and objectGuestPolicies.size() >= guestMaxPolicies) {
+      return #err("Guest policy capacity reached");
+    };
+    objectGuestPolicies := Array.append<(Text, Principal, Bool)>(
+      Array.filter<(Text, Principal, Bool)>(
+        objectGuestPolicies, func(e) { e.0 != objectId }
+      ),
+      [(objectId, gateway, enabled)]
+    );
+    #ok(enabled)
+  };
+
+  private func roundPublicCoordinate(value : Float) : Float {
+    Float.floor(value * 1000.0 + 0.5) / 1000.0
+  };
+
+  // JSON-safe text for existing versioned CheckPoint note metadata.
+  private func escapeGuestNote(note : Text) : ?Text {
+    var out = "";
+    for (ch in note.chars()) {
+      if (ch == '"') { out #= "\\\"" }
+      else if (ch == '\\') { out #= "\\\\" }
+      else if (ch == '\n') { out #= "\\n" }
+      else if (ch == '\r') { out #= "\\r" }
+      else if (ch == '\t') { out #= "\\t" }
+      else if (Char.toNat32(ch) < 32) { return null }
+      else { out #= Text.fromChar(ch) };
+    };
+    ?out
+  };
+
+  public shared ({ caller }) func submitGuestCheckin(
+    input : GuestCheckinInput
+  ) : async Result.Result<Nat, GuestCheckinError> {
+    // The calling Principal is the server relay, not an anonymous visitor.
+    let policy = switch (guestPolicy(input.objectId)) {
+      case null { return #err(#disabled) };
+      case (?value) { value };
+    };
+    if (caller != policy.0) return #err(#unauthorized);
+    if (not policy.1) return #err(#disabled);
+    switch (objectTrack(input.objectId)) {
+      case null { return #err(#notFound) };
+      case (?_) {};
+    };
+    if (not (input.latitude >= -90.0 and input.latitude <= 90.0) or
+        not (input.longitude >= -180.0 and input.longitude <= 180.0) or
+        input.accuracyMeters > 2000 or Text.size(input.note) > 280 or
+        Blob.size(Text.encodeUtf8(input.note)) > 1200 or
+        Text.size(input.requestId) != 36) {
+      return #err(#invalid);
+    };
+    let safeNote = switch (escapeGuestNote(input.note)) {
+      case null { return #err(#invalid) };
+      case (?text) { text };
+    };
+    for ((storedObject, storedRequest, _) in guestRequestReceipts.vals()) {
+      if (storedObject == input.objectId and storedRequest == input.requestId) {
+        return #err(#duplicate);
+      };
+    };
+    let now = Time.now();
+    let day = now / guestDayNs;
+    var count : Nat = 0;
+    var lastAt : Int = 0;
+    for ((objectId, usageDay, dailyCount, lastTime) in guestDailyUsage.vals()) {
+      if (objectId == input.objectId and usageDay == day) {
+        count := dailyCount;
+        lastAt := lastTime;
+      };
+    };
+    if (count >= guestDailyLimit or
+        (lastAt > 0 and now - lastAt < guestMinimumGapNs)) {
+      return #err(#rateLimited);
+    };
+    let actionText = switch (input.action) {
+      case (#found) { "found" };
+      case (#carried) { "carried" };
+      case (#left) { "left" };
+    };
+    let noteJson = "{\"action\":\"" # actionText #
+      "\",\"accuracyMeters\":" # Nat.toText(input.accuracyMeters) #
+      ",\"note\":\"" # safeNote # "\"}";
+    let cp : Types.CheckPoint = {
+      trackId = input.objectId;
+      groupId = null;
+      latitude = roundPublicCoordinate(input.latitude);
+      longitude = roundPublicCoordinate(input.longitude);
+      elevation = 0.0;
+      note = guestCheckpointPrefix # noteJson;
+      photo = null;
+      timestamp = now;
+      isPublic = true;
+      createdBy = caller;
+    };
+    // Atomic in one update: there is no await between checks and all writes.
+    guestDailyUsage := Array.append<(Text, Int, Nat, Int)>(
+      Array.filter<(Text, Int, Nat, Int)>(
+        guestDailyUsage,
+        func(u) { u.1 == day and u.0 != input.objectId }
+      ),
+      [(input.objectId, day, count + 1, now)]
+    );
+    let recent = Array.filter<(Text, Text, Int)>(
+      guestRequestReceipts,
+      func(r) { now - r.2 < 7 * guestDayNs }
+    );
+    let keep = if (recent.size() >= guestMaxReceipts) {
+      let offset = recent.size() - guestMaxReceipts + 1;
+      Array.tabulate<(Text, Text, Int)>(
+        recent.size() - offset,
+        func(i) { recent[i + offset] }
+      )
+    } else { recent };
+    guestRequestReceipts := Array.append<(Text, Text, Int)>(
+      keep, [(input.objectId, input.requestId, now)]
+    );
+    checkpoints := List.push<Types.CheckPoint>(cp, checkpoints);
+    #ok(1)
   };
 
   //==========================================================
@@ -537,6 +734,18 @@ persistent actor {
   public shared (msg) func createTrack(track : Types.NewTrack) : async Result.Result<Types.Track, Text> {
     if (Principal.isAnonymous(msg.caller)) {
       return #err("Anonymous users are not allowed to create tracks");
+    };
+
+    // Objects have unique IDs; reject shadowing another owner's public QR.
+    if (Text.startsWith(track.id, #text "obj-")) {
+      if (not track.isPublic or track.trackType != #other or
+          not Text.startsWith(track.description, #text objectMetadataPrefix)) {
+        return #err("Invalid object tracking record");
+      };
+      switch (List.find<Types.Track>(tracks, func(t) { t.id == track.id })) {
+        case (?_) { return #err("Object ID already exists") };
+        case null {};
+      };
     };
 
     let newTrack : Types.Track = {
