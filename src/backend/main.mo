@@ -246,7 +246,7 @@ persistent actor {
     if (not (input.latitude >= -90.0 and input.latitude <= 90.0) or
         not (input.longitude >= -180.0 and input.longitude <= 180.0) or
         input.accuracyMeters > 2000 or Text.size(input.note) > 280 or
-        Blob.size(Text.encodeUtf8(input.note)) > 1200 or
+        Array.size(Blob.toArray(Text.encodeUtf8(input.note))) > 1200 or
         Text.size(input.requestId) != 36) {
       return #err(#invalid);
     };
