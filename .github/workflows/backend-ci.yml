@@ -18,3 +18,5 @@ jobs:
           dfx start --background --clean
           dfx canister create backend
           dfx build backend
+      - name: Test guest object ACL, replay and upgrade persistence
+        run: bash scripts/test-object-guest.sh
