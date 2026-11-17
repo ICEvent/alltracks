@@ -218,13 +218,13 @@ persistent actor {
   private func escapeGuestNote(note : Text) : ?Text {
     var out = "";
     for (ch in note.chars()) {
-      if (ch == '"') { out #= "\\\"" }
-      else if (ch == '\\') { out #= "\\\\" }
-      else if (ch == '\n') { out #= "\\n" }
-      else if (ch == '\r') { out #= "\\r" }
-      else if (ch == '\t') { out #= "\\t" }
+      if (ch == '"') { out := out # "\\\"" }
+      else if (ch == '\\') { out := out # "\\\\" }
+      else if (ch == '\n') { out := out # "\\n" }
+      else if (ch == '\r') { out := out # "\\r" }
+      else if (ch == '\t') { out := out # "\\t" }
       else if (Char.toNat32(ch) < 32) { return null }
-      else { out #= Text.fromChar(ch) };
+      else { out := out # Text.fromChar(ch) };
     };
     ?out
   };
