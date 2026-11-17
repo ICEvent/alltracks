@@ -1,0 +1,7 @@
+.env
+canister_ids.json
+node_modules
+.dfx
+.DS_Store
+declarations
+src/frontend/dist
