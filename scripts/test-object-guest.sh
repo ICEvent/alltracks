@@ -106,7 +106,7 @@ closed_cp="$(dfx --identity unrelated canister call backend createCheckpoint \
   '(record {
     trackId = "obj-11111111-1111-4111-8111-111111111111";
     latitude = 49.5; longitude = -122.5; elevation = 0.0;
-    note = "alltracks:object-checkin:v1:{\"action\":\"found\",\"note\":\"private note should be stripped\"}";
+    note = "alltracks:object-checkin:v1:{\"action\":\"found\",\"accuracyMeters\":20,\"note\":\"private note should be stripped\",\"requestId\":\"55555555-5555-4555-8555-555555555555\"}";
     groupId = null; photo = opt "https://example.com/photo.jpg";
     timestamp = 1760000000000000010; isPublic = true
   })')"
@@ -114,6 +114,7 @@ echo "$closed_cp" | grep -q 'ok'
 stops="$(dfx canister call backend getCheckPointsByTrackId "(\"$object_id\")" --query)"
 echo "$stops" | grep -q '49.5'
 ! echo "$stops" | grep -q 'private note should be stripped'
+echo "$stops" | grep -q '55555555-5555-4555-8555-555555555555'
 ! echo "$stops" | grep -q 'example.com/photo.jpg'
 
 # Reopening comments enables new notes; deletion removes the entire Checkpoint.
