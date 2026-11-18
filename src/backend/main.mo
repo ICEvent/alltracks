@@ -37,6 +37,8 @@ persistent actor {
   private  var userCredentialsEntries : [(Principal, Types.UserCredential)] = [];
   // Additive stable fields: compatible with the existing Track/Checkpoint model.
   private var objectGuestPolicies : [(Text, Principal, Bool)] = [];
+  // Additive stable field. A closed Object still accepts location-only check-ins.
+  private var objectCommentsClosed : [Text] = [];
   private var guestRequestReceipts : [(Text, Text, Int)] = [];
   private var guestDailyUsage : [(Text, Int, Nat, Int)] = [];
 
@@ -177,6 +179,108 @@ persistent actor {
     null
   };
 
+  private func objectCommentsEnabled(objectId : Text) : Bool {
+    for (id in objectCommentsClosed.vals()) {
+      if (id == objectId) return false;
+    };
+    true
+  };
+
+  // Public read supports the owner setting and the visitor's comment form.
+  // Unknown IDs return null; valid legacy objects default to comments enabled.
+  public query func getObjectCommentsEnabled(objectId : Text) : async ?Bool {
+    switch (objectTrack(objectId)) {
+      case null { null };
+      case (?_) { ?objectCommentsEnabled(objectId) };
+    }
+  };
+
+  public shared ({ caller }) func setObjectCommentsEnabled(
+    objectId : Text, enabled : Bool
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only owner may manage comments");
+      };
+    };
+    if (not enabled and objectCommentsEnabled(objectId) and
+        objectCommentsClosed.size() >= guestMaxPolicies) {
+      return #err("Object comment policy capacity reached");
+    };
+    let other = Array.filter<Text>(objectCommentsClosed, func(id) { id != objectId });
+    objectCommentsClosed := if (enabled) { other } else {
+      Array.append<Text>(other, [objectId])
+    };
+    #ok(enabled)
+  };
+
+  // Keep the check-in's action/position while discarding user-supplied text,
+  // embedded image URL and native photo. Reject malformed Object metadata.
+  private func redactedObjectNote(note : Text) : ?Text {
+    let base = guestCheckpointPrefix # "{\"action\":\"";
+    let action = if (Text.startsWith(note, #text (base # "found\""))) {
+      "found"
+    } else if (Text.startsWith(note, #text (base # "carried\""))) {
+      "carried"
+    } else if (Text.startsWith(note, #text (base # "left\""))) {
+      "left"
+    } else { return null };
+    ?(guestCheckpointPrefix # "{\"action\":\"" # action # "\",\"note\":\"\"}")
+  };
+
+  // Signed-in author can redact their own note; the Object owner may moderate
+  // any note, including gateway-authored guest reports. The checkpoint remains.
+  public shared ({ caller }) func deleteObjectComment(
+    objectId : Text, timestamp : Time.Time, author : Principal
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    let owner = switch (objectTrack(objectId)) {
+      case null { return #err("Object not found") };
+      case (?item) { item.createdBy };
+    };
+    if (caller != owner and caller != author) return #err("Not authorized");
+    let matching = List.filter<Types.CheckPoint>(
+      checkpoints, func(cp) {
+        cp.trackId == objectId and cp.timestamp == timestamp and
+        cp.createdBy == author and cp.isPublic
+      }
+    );
+    if (List.size(matching) != 1) return #err("Check-in not found or ambiguous");
+    let original = switch (List.head(matching)) {
+      case (?cp) { cp };
+      case null { return #err("Check-in not found") };
+    };
+    let stripped = switch (redactedObjectNote(original.note)) {
+      case null { return #err("This is not an Object check-in") };
+      case (?safe) { safe };
+    };
+    if (original.note == stripped and original.photo == null) {
+      return #err("Comment already removed");
+    };
+    checkpoints := List.map<Types.CheckPoint, Types.CheckPoint>(
+      checkpoints, func(cp) {
+        if (cp.trackId == objectId and cp.timestamp == timestamp and
+            cp.createdBy == author and cp.isPublic) {
+          {
+            trackId = cp.trackId;
+            groupId = cp.groupId;
+            latitude = cp.latitude;
+            longitude = cp.longitude;
+            elevation = cp.elevation;
+            note = stripped;
+            photo = null;
+            timestamp = cp.timestamp;
+            isPublic = cp.isPublic;
+            createdBy = cp.createdBy;
+          }
+        } else { cp }
+      }
+    );
+    #ok(true)
+  };
+
   public query func getObjectGuestPolicy(objectId : Text) : async ?{
     enabled : Bool;
     gateway : Principal;
@@ -278,9 +382,10 @@ persistent actor {
       case (#carried) { "carried" };
       case (#left) { "left" };
     };
+    let storedNote = if (objectCommentsEnabled(input.objectId)) { safeNote } else { "" };
     let noteJson = "{\"action\":\"" # actionText #
       "\",\"accuracyMeters\":" # Nat.toText(input.accuracyMeters) #
-      ",\"note\":\"" # safeNote # "\"}";
+      ",\"note\":\"" # storedNote # "\"}";
     let cp : Types.CheckPoint = {
       trackId = input.objectId;
       groupId = null;
@@ -328,14 +433,34 @@ persistent actor {
       return #err("Anonymous users are not allowed to create checkpoints");
     };
 
+    // Object owners can stop new text/photo comments without stopping location
+    // check-ins. Enforce this in the canister (not only in the browser).
+    var storedNote = checkpoint.note;
+    var storedPhoto = checkpoint.photo;
+    if (Text.startsWith(checkpoint.trackId, #text "obj-")) {
+      switch (objectTrack(checkpoint.trackId)) {
+        case null { return #err("Object not found") };
+        case (?_) {};
+      };
+      if (not objectCommentsEnabled(checkpoint.trackId)) {
+        switch (redactedObjectNote(checkpoint.note)) {
+          case null { return #err("Object comments are closed") };
+          case (?safe) {
+            storedNote := safe;
+            storedPhoto := null;
+          };
+        };
+      };
+    };
+
     let cp : Types.CheckPoint = {
       trackId = checkpoint.trackId;
       groupId = checkpoint.groupId;
       latitude = checkpoint.latitude;
       longitude = checkpoint.longitude;
       elevation = checkpoint.elevation;
-      note = checkpoint.note;
-      photo = checkpoint.photo;
+      note = storedNote;
+      photo = storedPhoto;
       timestamp = checkpoint.timestamp;
       isPublic = checkpoint.isPublic;
       createdBy = msg.caller;
