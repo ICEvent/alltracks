@@ -216,8 +216,37 @@ persistent actor {
     #ok(enabled)
   };
 
-  // Keep the check-in's action/position while discarding user-supplied text,
-  // embedded image URL and native photo. Reject malformed Object metadata.
+  // Keep the offline submission's UUID requestId when stripping user notes.
+  // Otherwise a lost update response could make the outbox resubmit the
+  // same location because the duplicate check searches for that requestId.
+  // Recognize only a canonical trailing JSON string UUID; do not reuse any
+  // user-supplied JSON or untrusted embedded photo link.
+  private func retainedObjectRequestId(note : Text) : Text {
+    let parts = Iter.toArray(Text.split(note, #text ",\"requestId\":\""));
+    if (parts.size() != 2) return "";
+    let chars = Iter.toArray(parts[1].chars());
+    if (chars.size() != 38 or chars[36] != '"' or chars[37] != '}') return "";
+    var valid = true;
+    for (i in Iter.range(0, 35)) {
+      let char = chars[i];
+      if (i == 8 or i == 13 or i == 18 or i == 23) {
+        if (char != '-') valid := false;
+      } else {
+        let n = Char.toNat32(char);
+        if (not (
+          (n >= 48 and n <= 57) or
+          (n >= 65 and n <= 70) or
+          (n >= 97 and n <= 102)
+        )) valid := false;
+      };
+    };
+    if (not valid) return "";
+    let uuid = Text.fromIter(Array.tabulate<Char>(36, func(i) { chars[i] }).vals());
+    ",\"requestId\":\"" # uuid # "\""
+  };
+
+  // Keep check-in location and action, redact attached note/photo, while
+  // retaining only the validated requestId required for offline deduplication.
   private func redactedObjectNote(note : Text) : ?Text {
     let base = guestCheckpointPrefix # "{\"action\":\"";
     let action = if (Text.startsWith(note, #text (base # "found\""))) {
@@ -227,7 +256,8 @@ persistent actor {
     } else if (Text.startsWith(note, #text (base # "left\""))) {
       "left"
     } else { return null };
-    ?(guestCheckpointPrefix # "{\"action\":\"" # action # "\",\"note\":\"\"}")
+    ?(guestCheckpointPrefix # "{\"action\":\"" # action # "\",\"note\":\"\"" #
+      retainedObjectRequestId(note) # "}")
   };
 
   // Delete one whole Object Checkpoint, including its location and public note.
