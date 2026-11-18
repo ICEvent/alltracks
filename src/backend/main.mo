@@ -225,7 +225,7 @@ persistent actor {
     let parts = Iter.toArray(Text.split(note, #text ",\"requestId\":\""));
     if (parts.size() != 2) return "";
     let chars = Iter.toArray(parts[1].chars());
-    if (chars.size() != 38 or chars[36] != '"' or chars[37] != '}') return "";
+    if (chars.size() != 38 or chars[36] != '\"' or chars[37] != '}') return "";
     var valid = true;
     for (i in Iter.range(0, 35)) {
       let char = chars[i];
