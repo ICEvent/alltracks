@@ -230,9 +230,11 @@ persistent actor {
     ?(guestCheckpointPrefix # "{\"action\":\"" # action # "\",\"note\":\"\"}")
   };
 
-  // Signed-in author can redact their own note; the Object owner may moderate
-  // any note, including gateway-authored guest reports. The checkpoint remains.
-  public shared ({ caller }) func deleteObjectComment(
+  // Delete one whole Object Checkpoint, including its location and public note.
+  // Other tracks and other Object check-ins are never touched.
+  // Gateway-authored guest check-ins can be deleted by the Object owner,
+  // but not by an unrelated user sharing the public QR.
+  public shared ({ caller }) func deleteObjectCheckpoint(
     objectId : Text, timestamp : Time.Time, author : Principal
   ) : async Result.Result<Bool, Text> {
     if (Principal.isAnonymous(caller)) return #err("Login required");
@@ -244,40 +246,24 @@ persistent actor {
     let matching = List.filter<Types.CheckPoint>(
       checkpoints, func(cp) {
         cp.trackId == objectId and cp.timestamp == timestamp and
-        cp.createdBy == author and cp.isPublic
+        cp.createdBy == author and cp.isPublic and
+        Text.startsWith(cp.note, #text guestCheckpointPrefix)
       }
     );
-    if (List.size(matching) != 1) return #err("Check-in not found or ambiguous");
-    let original = switch (List.head(matching)) {
-      case (?cp) { cp };
-      case null { return #err("Check-in not found") };
-    };
-    let stripped = switch (redactedObjectNote(original.note)) {
-      case null { return #err("This is not an Object check-in") };
-      case (?safe) { safe };
-    };
-    if (original.note == stripped and original.photo == null) {
-      return #err("Comment already removed");
-    };
-    checkpoints := List.map<Types.CheckPoint, Types.CheckPoint>(
+    // A legacy Track checkpoint isn't eligible, and ambiguous IDs must fail
+    // closed rather than deleting multiple checkpoints.
+    if (List.size(matching) != 1) return #err("Object check-in not found or ambiguous");
+    checkpoints := List.filter<Types.CheckPoint>(
       checkpoints, func(cp) {
-        if (cp.trackId == objectId and cp.timestamp == timestamp and
-            cp.createdBy == author and cp.isPublic) {
-          {
-            trackId = cp.trackId;
-            groupId = cp.groupId;
-            latitude = cp.latitude;
-            longitude = cp.longitude;
-            elevation = cp.elevation;
-            note = stripped;
-            photo = null;
-            timestamp = cp.timestamp;
-            isPublic = cp.isPublic;
-            createdBy = cp.createdBy;
-          }
-        } else { cp }
+        not (
+          cp.trackId == objectId and cp.timestamp == timestamp and
+          cp.createdBy == author and cp.isPublic and
+          Text.startsWith(cp.note, #text guestCheckpointPrefix)
+        )
       }
     );
+    // Keep replay receipts and daily guest quota: deletion must not allow
+    // bypassing rate limits or replaying removed submissions.
     #ok(true)
   };
 
