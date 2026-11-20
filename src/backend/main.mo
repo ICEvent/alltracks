@@ -41,6 +41,18 @@ persistent actor {
   private var objectCommentsClosed : [Text] = [];
   private var guestRequestReceipts : [(Text, Text, Int)] = [];
   private var guestDailyUsage : [(Text, Int, Nat, Int)] = [];
+  // Durable publication intents are NOT public photo bindings. They provide
+  // idempotency and a recovery inventory before ICEStorage manifest writes.
+  public type WanderPhotoPublicationIntent = {
+    objectId : Text;
+    storageObjectId : Text;
+    requestedBy : Principal;
+    requestedAt : Int;
+    state : { #pending; #cancelled };
+  };
+  private var wanderPhotoPublicationIntents : [WanderPhotoPublicationIntent] = [];
+  private let wanderPhotoIntentLimit : Nat = 5000;
+
 
 
   private transient var userCredentials = HashMap.HashMap<Principal, Types.UserCredential>(1, Principal.equal, Principal.hash);
@@ -296,6 +308,78 @@ persistent actor {
         };
       }
     } catch (_) { #err("Photo verification service unavailable") }
+  };
+
+  // This reserves a durable, non-public publication intent. It does NOT
+  // assert that the upload is complete or that ICEStorage has published it.
+  public shared ({ caller }) func prepareOwnedWanderPhotoPublication(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<WanderPhotoPublicationIntent, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may prepare publication");
+      };
+    };
+    if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
+      return #err("Invalid storage object ID");
+    };
+    // One ICEStorage object may not be assigned to multiple Wander objects.
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.storageObjectId == storageObjectId) {
+        if (intent.objectId == objectId and intent.requestedBy == caller and
+            intent.state == #pending) return #ok(intent);
+        return #err("Storage object already has a publication intent");
+      };
+    };
+    if (wanderPhotoPublicationIntents.size() >= wanderPhotoIntentLimit) {
+      return #err("Publication queue is full");
+    };
+    let intent : WanderPhotoPublicationIntent = {
+      objectId;
+      storageObjectId;
+      requestedBy = caller;
+      requestedAt = Time.now();
+      state = #pending;
+    };
+    wanderPhotoPublicationIntents := Array.append(
+      wanderPhotoPublicationIntents, [intent],
+    );
+    #ok(intent)
+  };
+
+  public shared ({ caller }) func cancelOwnedWanderPhotoPublication(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    var found = false;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+          intent.requestedBy == caller and intent.state == #pending) {
+        found := true;
+      };
+    };
+    if (not found) return #err("Pending publication not found");
+    wanderPhotoPublicationIntents := Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        not (intent.objectId == objectId and
+             intent.storageObjectId == storageObjectId and intent.requestedBy == caller)
+      },
+    );
+    #ok(true)
+  };
+
+  public shared query ({ caller }) func listMyWanderPhotoPublicationIntents(
+  ) : async [WanderPhotoPublicationIntent] {
+    if (Principal.isAnonymous(caller)) return [];
+    Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) { intent.requestedBy == caller },
+    )
   };
 
   private func guestPolicy(id : Text) : ?(Principal, Bool) {
