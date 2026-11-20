@@ -172,6 +172,43 @@ persistent actor {
     }
   };
 
+  // Stage 1: only the Wander object owner can request a photo grant.
+  // Public/guest check-in uploads need a separate abuse-resistant authorization path.
+  private let wanderStorage : actor {
+    issueProjectUploadGrant : shared (Principal, Text, Text, Nat, ?Blob) -> async {
+      #ok : Text;
+      #err : Text;
+    };
+  } = actor ("5pqgi-saaaa-aaaal-aaavq-cai");
+
+  public shared ({ caller }) func requestWanderPhotoUploadGrant(
+    objectId : Text,
+    mimeType : Text,
+    size : Nat,
+  ) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner can upload in this phase");
+      };
+    };
+    if (size == 0 or size > 10_485_760) return #err("Invalid photo size");
+    if (mimeType != "image/jpeg" and mimeType != "image/png" and
+        mimeType != "image/webp") return #err("Unsupported photo type");
+
+    try {
+      switch (await wanderStorage.issueProjectUploadGrant(
+        caller, objectId, mimeType, size, null,
+      )) {
+        case (#ok(grantId)) { #ok(grantId) };
+        case (#err(message)) { #err(message) };
+      }
+    } catch (_) {
+      #err("Photo authorization service unavailable")
+    }
+  };
+
   private func guestPolicy(id : Text) : ?(Principal, Bool) {
     for ((storedId, gateway, enabled) in objectGuestPolicies.vals()) {
       if (storedId == id) return ?(gateway, enabled);
