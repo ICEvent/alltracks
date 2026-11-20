@@ -326,6 +326,28 @@ persistent actor {
     if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
       return #err("Invalid storage object ID");
     };
+    // Confirm the upload before reserving an intent. A client-supplied
+    // object ID is never proof that ICEStorage contains a completed photo.
+    let verified = try {
+      switch (await wanderStorage.getObjectInfo(storageObjectId)) {
+        case (#err(_)) { false };
+        case (#ok(info)) {
+          info.objectId == storageObjectId and info.owner == caller and
+          info.status == #complete and info.size > 0 and
+          info.size <= 10_485_760 and
+          (info.mimeType == "image/jpeg" or info.mimeType == "image/png" or
+           info.mimeType == "image/webp")
+        };
+      }
+    } catch (_) { false };
+    if (not verified) return #err("Completed owned photo not found in ICEStorage");
+    // Recheck after await; owner or object state may have changed.
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object no longer exists") };
+      case (?current) {
+        if (current.createdBy != caller) return #err("Wander object ownership changed");
+      };
+    };
     // One ICEStorage object may not be assigned to multiple Wander objects.
     for (intent in wanderPhotoPublicationIntents.vals()) {
       if (intent.storageObjectId == storageObjectId) {
