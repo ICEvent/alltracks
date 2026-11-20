@@ -388,12 +388,16 @@ persistent actor {
   ) : async Result.Result<Bool, Text> {
     if (Principal.isAnonymous(caller)) return #err("Login required");
     var found = false;
+    var alreadyCancelled = false;
     for (intent in wanderPhotoPublicationIntents.vals()) {
       if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
-          intent.requestedBy == caller and intent.state == #pending) {
-        found := true;
+          intent.requestedBy == caller) {
+        if (intent.state == #pending) { found := true }
+        else { alreadyCancelled := true };
       };
     };
+    // Replayed cancellation after a lost acknowledgement is successful.
+    if (not found and alreadyCancelled) return #ok(true);
     if (not found) return #err("Pending publication not found");
     // Keep a tombstone to prevent a cancelled storage object from being
     // rebound to another Wander object without explicit reconciliation.
