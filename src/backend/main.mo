@@ -363,11 +363,15 @@ persistent actor {
       };
     };
     if (not found) return #err("Pending publication not found");
-    wanderPhotoPublicationIntents := Array.filter<WanderPhotoPublicationIntent>(
+    // Keep a tombstone to prevent a cancelled storage object from being
+    // rebound to another Wander object without explicit reconciliation.
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) {
-        not (intent.objectId == objectId and
-             intent.storageObjectId == storageObjectId and intent.requestedBy == caller)
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+            intent.requestedBy == caller) {
+          { intent with state = #cancelled }
+        } else { intent }
       },
     );
     #ok(true)
