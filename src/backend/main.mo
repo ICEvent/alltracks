@@ -206,7 +206,7 @@ persistent actor {
       #ok : Text;
       #err : Text;
     };
-    getObjectInfo : shared query Text -> async {
+    getProjectUploadedObjectInfo : shared query (Text, Text) -> async {
       #ok : WanderStorageObjectInfo;
       #err : {
         #alreadyExists;
@@ -280,7 +280,7 @@ persistent actor {
       return #err("Invalid storage object ID");
     };
     try {
-      switch (await wanderStorage.getObjectInfo(storageObjectId)) {
+      switch (await wanderStorage.getProjectUploadedObjectInfo(storageObjectId, objectId)) {
         case (#err(_)) { #err("Storage object unavailable") };
         case (#ok(info)) {
           // The object may have been removed or changed while awaiting
@@ -329,7 +329,7 @@ persistent actor {
     // Confirm the upload before reserving an intent. A client-supplied
     // object ID is never proof that ICEStorage contains a completed photo.
     let verified = try {
-      switch (await wanderStorage.getObjectInfo(storageObjectId)) {
+      switch (await wanderStorage.getProjectUploadedObjectInfo(storageObjectId, objectId)) {
         case (#err(_)) { false };
         case (#ok(info)) {
           info.objectId == storageObjectId and info.owner == caller and
