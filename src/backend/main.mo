@@ -264,7 +264,7 @@ persistent actor {
         if (item.createdBy != caller) return #err("Only the object owner may verify uploads");
       };
     };
-    if (storageObjectId.size() == 0 or storageObjectId.size() > 256) {
+    if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
       return #err("Invalid storage object ID");
     };
     try {
