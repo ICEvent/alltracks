@@ -174,6 +174,13 @@ persistent actor {
 
   // Stage 1: only the Wander object owner can request a photo grant.
   // Public/guest check-in uploads need a separate abuse-resistant authorization path.
+  // Persist grant throttle across upgrades. Reserve before the cross-canister
+  // await so concurrent requests cannot bypass the per-user limit.
+  private var wanderPhotoGrantAttempts : [(Principal, Int)] = [];
+  private let wanderPhotoGrantCooldownNs : Int = 30_000_000_000;
+  private let wanderPhotoGrantRetentionNs : Int = 86_400_000_000_000;
+  private let wanderPhotoGrantMaxEntries : Nat = 5000;
+
   private let wanderStorage : actor {
     issueProjectUploadGrant : shared (Principal, Text, Text, Nat, ?Blob) -> async {
       #ok : Text;
@@ -196,6 +203,22 @@ persistent actor {
     if (size == 0 or size > 10_485_760) return #err("Invalid photo size");
     if (mimeType != "image/jpeg" and mimeType != "image/png" and
         mimeType != "image/webp") return #err("Unsupported photo type");
+
+    let now = Time.now();
+    // Drop old reservations and enforce a bounded stable table.
+    let recent = Array.filter<(Principal, Int)>(
+      wanderPhotoGrantAttempts,
+      func(entry) { entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs },
+    );
+    for ((user, timestamp) in recent.vals()) {
+      if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
+        return #err("Please wait before requesting another photo upload");
+      };
+    };
+    if (recent.size() >= wanderPhotoGrantMaxEntries) {
+      return #err("Photo upload authorization is temporarily busy");
+    };
+    wanderPhotoGrantAttempts := Array.append<(Principal, Int)>(recent, [(caller, now)]);
 
     try {
       switch (await wanderStorage.issueProjectUploadGrant(
