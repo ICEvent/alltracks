@@ -181,10 +181,29 @@ persistent actor {
   private let wanderPhotoGrantRetentionNs : Int = 86_400_000_000_000;
   private let wanderPhotoGrantMaxEntries : Nat = 5000;
 
+  public type WanderStorageObjectInfo = {
+    objectId : Text;
+    owner : Principal;
+    mimeType : Text;
+    size : Nat;
+    status : { #uploading; #complete; #aborted };
+  };
+
   private let wanderStorage : actor {
     issueProjectUploadGrant : shared (Principal, Text, Text, Nat, ?Blob) -> async {
       #ok : Text;
       #err : Text;
+    };
+    getObjectInfo : shared query Text -> async {
+      #ok : WanderStorageObjectInfo;
+      #err : {
+        #alreadyExists;
+        #conflict : { currentRevision : Nat64 };
+        #forbidden;
+        #internal : Text;
+        #invalid : Text;
+        #notFound;
+      };
     };
   } = actor ("5pqgi-saaaa-aaaal-aaavq-cai");
 
@@ -230,6 +249,43 @@ persistent actor {
     } catch (_) {
       #err("Photo authorization service unavailable")
     }
+  };
+
+  // Read-only verification; this does NOT publish the photo or bind it to a
+  // Checkpoint. ObjectInfo is authoritative for upload completion and owner.
+  public shared ({ caller }) func verifyOwnedWanderPhotoUpload(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may verify uploads");
+      };
+    };
+    if (storageObjectId.size() == 0 or storageObjectId.size() > 256) {
+      return #err("Invalid storage object ID");
+    };
+    try {
+      switch (await wanderStorage.getObjectInfo(storageObjectId)) {
+        case (#err(_)) { #err("Storage object unavailable") };
+        case (#ok(info)) {
+          if (info.objectId != storageObjectId or info.owner != caller) {
+            return #err("Storage object owner mismatch");
+          };
+          if (info.status != #complete) return #err("Photo upload is incomplete");
+          if (info.size == 0 or info.size > 10_485_760) {
+            return #err("Invalid stored photo size");
+          };
+          if (info.mimeType != "image/jpeg" and info.mimeType != "image/png" and
+              info.mimeType != "image/webp") {
+            return #err("Unsupported stored photo type");
+          };
+          #ok(true)
+        };
+      }
+    } catch (_) { #err("Photo verification service unavailable") }
   };
 
   private func guestPolicy(id : Text) : ?(Principal, Bool) {
