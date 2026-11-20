@@ -356,6 +356,16 @@ persistent actor {
         return #err("Storage object already has a publication intent");
       };
     };
+    // A single account must not exhaust the global durable intent table.
+    var callerIntentCount : Nat = 0;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.requestedBy == caller and intent.state == #pending) {
+        callerIntentCount += 1;
+      };
+    };
+    if (callerIntentCount >= 20) {
+      return #err("Too many pending photo publications");
+    };
     if (wanderPhotoPublicationIntents.size() >= wanderPhotoIntentLimit) {
       return #err("Publication queue is full");
     };
