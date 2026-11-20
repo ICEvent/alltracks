@@ -271,6 +271,16 @@ persistent actor {
       switch (await wanderStorage.getObjectInfo(storageObjectId)) {
         case (#err(_)) { #err("Storage object unavailable") };
         case (#ok(info)) {
+          // The object may have been removed or changed while awaiting
+          // ICEStorage. Never trust only the pre-await authorization check.
+          switch (objectTrack(objectId)) {
+            case null { return #err("Wander object no longer exists") };
+            case (?current) {
+              if (current.createdBy != caller) {
+                return #err("Wander object ownership changed");
+              };
+            };
+          };
           if (info.objectId != storageObjectId or info.owner != caller) {
             return #err("Storage object owner mismatch");
           };
