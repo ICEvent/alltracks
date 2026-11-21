@@ -48,7 +48,7 @@ persistent actor {
     storageObjectId : Text;
     requestedBy : Principal;
     requestedAt : Int;
-    state : { #pending; #cancelled };
+    state : { #pending; #publishing; #published; #cancelled };
   };
   private var wanderPhotoPublicationIntents : [WanderPhotoPublicationIntent] = [];
   private let wanderPhotoIntentLimit : Nat = 5000;
@@ -205,6 +205,21 @@ persistent actor {
     issueProjectUploadGrant : shared (Principal, Text, Text, Nat, ?Blob) -> async {
       #ok : Text;
       #err : Text;
+    };
+    publishProjectPhoto : shared (Text, Text) -> async {
+      #ok : {
+        key : {
+          resourceId : Text;
+          storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
+        };
+        status : { #active; #draft; #revoked; #deleted };
+        visibility : { #private; #unlisted; #public };
+        metadata : [(Text, Text)];
+      };
+      #err : {
+        #alreadyExists; #conflict : { currentRevision : Nat64 };
+        #forbidden; #internal : Text; #invalid : Text; #notFound;
+      };
     };
     getProjectUploadedObjectInfo : shared query (Text, Text) -> async {
       #ok : WanderStorageObjectInfo;
@@ -382,6 +397,66 @@ persistent actor {
     #ok(intent)
   };
 
+  // Project-backend publication, never a browser-side createResource call.
+  // Reserve the stable intent before await to prevent duplicate publication.
+  public shared ({ caller }) func publishOwnedWanderPhoto(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may publish");
+      };
+    };
+    var found = false;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+        switch (intent.state) {
+          case (#published) return #ok(true);
+          case (#publishing) return #err("Photo publication is in progress; retry later");
+          case (#cancelled) return #err("Photo publication was cancelled");
+          case (#pending) { found := true };
+        };
+      };
+    };
+    if (not found) return #err("Prepare publication first");
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+          { intent with state = #publishing }
+        } else intent
+      },
+    );
+    let published = try {
+      switch (await wanderStorage.publishProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) {
+          resource.status == #active and resource.visibility == #unlisted and
+          resource.key.resourceId == storageObjectId and
+          resource.key.storage.storageId == "project-wander-photo" and
+          resource.key.storage.owner == #principal(caller) and
+          Array.find<(Text, Text)>(resource.metadata, func(entry) {
+            entry.0 == "wanderObjectId" and entry.1 == objectId
+          }) != null
+        };
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    // A failed/ambiguous response returns to pending. ICEStorage's publication
+    // endpoint is idempotent, so the next call safely reconciles lost replies.
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller and intent.state == #publishing) {
+          { intent with state = if (published) #published else #pending }
+        } else intent
+      },
+    );
+    if (published) #ok(true) else #err("Publication not confirmed; retry to reconcile")
+  };
+
   public shared ({ caller }) func cancelOwnedWanderPhotoPublication(
     objectId : Text,
     storageObjectId : Text,
@@ -393,7 +468,8 @@ persistent actor {
       if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
           intent.requestedBy == caller) {
         if (intent.state == #pending) { found := true }
-        else { alreadyCancelled := true };
+        else if (intent.state == #cancelled) { alreadyCancelled := true }
+        else { return #err("Cannot cancel an in-progress or published photo") };
       };
     };
     // Replayed cancellation after a lost acknowledgement is successful.
