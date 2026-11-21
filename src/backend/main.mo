@@ -570,6 +570,61 @@ persistent actor {
     #ok(true)
   };
 
+  // A bounded, permissionless cleanup pump for already-tombstoned photos.
+  // No caller can select a live photo for deletion through this endpoint.
+  // Any client can advance recovery after a guest removes a Checkpoint.
+  public shared func retryWanderPhotoCleanup(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    let eligible = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+        intent.state == #revoking
+      },
+    ) != null;
+    if (not eligible) return #err("No pending photo cleanup");
+    let revoked = try {
+      switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not revoked) return #err("Photo revocation not confirmed; retry later");
+    let deleted = try {
+      switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not deleted) return #err("Photo deletion not confirmed; retry later");
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+            intent.state == #revoking) { { intent with state = #deleted } }
+        else intent
+      },
+    );
+    #ok(true)
+  };
+
+  // Bounded public work inventory: exposes only tombstoned storage IDs,
+  // never owners, unpublished uploads, or other private intent metadata.
+  public query func listPendingWanderPhotoCleanup(
+    objectId : Text,
+  ) : async [Text] {
+    let pending = Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) { intent.objectId == objectId and intent.state == #revoking },
+    );
+    let limited = if (pending.size() > 20) {
+      Array.tabulate<WanderPhotoPublicationIntent>(20, func(i) { pending[i] })
+    } else pending;
+    Array.map<WanderPhotoPublicationIntent, Text>(limited, func(intent) { intent.storageObjectId })
+  };
+
   public shared ({ caller }) func cancelOwnedWanderPhotoPublication(
     objectId : Text,
     storageObjectId : Text,
