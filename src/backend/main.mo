@@ -221,7 +221,7 @@ persistent actor {
           storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
         };
         status : { #active; #draft; #revoked; #deleted };
-        visibility : { #private; #unlisted; #public; #restricted };
+        visibility : { #private_; #unlisted; #public_; #restricted };
         metadata : [(Text, Text)];
       };
       #err : {
@@ -236,7 +236,7 @@ persistent actor {
           storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
         };
         status : { #active; #draft; #revoked; #deleted };
-        visibility : { #private; #unlisted; #public; #restricted };
+        visibility : { #private_; #unlisted; #public_; #restricted };
         metadata : [(Text, Text)];
       };
       #err : {
@@ -251,7 +251,7 @@ persistent actor {
           storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
         };
         status : { #active; #draft; #revoked; #deleted };
-        visibility : { #private; #unlisted; #public; #restricted };
+        visibility : { #private_; #unlisted; #public_; #restricted };
         metadata : [(Text, Text)];
       };
       #err : {
