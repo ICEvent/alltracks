@@ -507,6 +507,43 @@ persistent actor {
     )
   };
 
+  // Public, canonical photo bindings are derived only from successfully
+  // published durable intents. Never expose pending uploads as readable photos.
+  public type PublishedWanderPhotoBinding = {
+    objectId : Text;
+    storageObjectId : Text;
+    storageOwner : Principal;
+    storageId : Text;
+    resourceId : Text;
+  };
+
+  public query func listPublishedWanderObjectPhotos(
+    objectId : Text,
+  ) : async [PublishedWanderPhotoBinding] {
+    switch (objectTrack(objectId)) {
+      case null return [];
+      case (?_) {};
+    };
+    let bindings = Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.state == #published
+      },
+    );
+    Array.map<WanderPhotoPublicationIntent, PublishedWanderPhotoBinding>(
+      bindings,
+      func(intent) {
+        {
+          objectId = intent.objectId;
+          storageObjectId = intent.storageObjectId;
+          storageOwner = intent.requestedBy;
+          storageId = "project-wander-photo";
+          resourceId = intent.storageObjectId;
+        }
+      },
+    )
+  };
+
   private func guestPolicy(id : Text) : ?(Principal, Bool) {
     for ((storedId, gateway, enabled) in objectGuestPolicies.vals()) {
       if (storedId == id) return ?(gateway, enabled);
