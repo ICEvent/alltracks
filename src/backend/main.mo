@@ -493,7 +493,17 @@ persistent actor {
         } else intent
       },
     );
-    if (published and not stillOwned) #err("Wander object changed during publication; cleanup required")
+    // A concurrent delete may have tombstoned this intent while the
+    // publication call was in flight. Never report a live photo in that case.
+    let stillPublishing = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+        intent.requestedBy == caller and intent.state == #published
+      },
+    ) != null;
+    if (published and not stillPublishing) #err("Publication superseded; cleanup required")
+    else if (published and not stillOwned) #err("Wander object changed during publication; cleanup required")
     else if (published) #ok(true)
     else #err("Publication not confirmed; retry to reconcile")
   };
