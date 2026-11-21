@@ -570,13 +570,19 @@ persistent actor {
     #ok(true)
   };
 
-  // A bounded, permissionless cleanup pump for already-tombstoned photos.
+  // Stable admission control prevents repeated cross-canister cleanup calls
+  // from consuming unbounded cycles. Reserve before the first await.
+  private var wanderCleanupLastAttempt : Int = 0;
+  private let wanderCleanupCooldownNs : Int = 5_000_000_000;
+
+  // Authenticated, globally throttled cleanup for tombstoned photos.
   // No caller can select a live photo for deletion through this endpoint.
-  // Any client can advance recovery after a guest removes a Checkpoint.
-  public shared func retryWanderPhotoCleanup(
+  // A signed-in user can advance recovery after a guest removes a Checkpoint.
+  public shared ({ caller }) func retryWanderPhotoCleanup(
     objectId : Text,
     storageObjectId : Text,
   ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
     let eligible = Array.find<WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) {
@@ -585,6 +591,12 @@ persistent actor {
       },
     ) != null;
     if (not eligible) return #err("No pending photo cleanup");
+    let now = Time.now();
+    if (now < wanderCleanupLastAttempt or
+        now - wanderCleanupLastAttempt < wanderCleanupCooldownNs) {
+      return #err("Cleanup is rate limited; retry later");
+    };
+    wanderCleanupLastAttempt := now;
     let revoked = try {
       switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
         case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
