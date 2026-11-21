@@ -48,7 +48,7 @@ persistent actor {
     storageObjectId : Text;
     requestedBy : Principal;
     requestedAt : Int;
-    state : { #pending; #publishing; #published; #cancelled };
+    state : { #pending; #publishing; #published; #revoking; #deleted; #cancelled };
   };
   private var wanderPhotoPublicationIntents : [WanderPhotoPublicationIntent] = [];
   private let wanderPhotoIntentLimit : Nat = 5000;
@@ -207,6 +207,36 @@ persistent actor {
       #err : Text;
     };
     publishProjectPhoto : shared (Text, Text) -> async {
+      #ok : {
+        key : {
+          resourceId : Text;
+          storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
+        };
+        status : { #active; #draft; #revoked; #deleted };
+        visibility : { #private; #unlisted; #public; #restricted };
+        metadata : [(Text, Text)];
+      };
+      #err : {
+        #alreadyExists; #conflict : { currentRevision : Nat64 };
+        #forbidden; #internal : Text; #invalid : Text; #notFound;
+      };
+    };
+    revokeProjectPhoto : shared (Text, Text) -> async {
+      #ok : {
+        key : {
+          resourceId : Text;
+          storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
+        };
+        status : { #active; #draft; #revoked; #deleted };
+        visibility : { #private; #unlisted; #public; #restricted };
+        metadata : [(Text, Text)];
+      };
+      #err : {
+        #alreadyExists; #conflict : { currentRevision : Nat64 };
+        #forbidden; #internal : Text; #invalid : Text; #notFound;
+      };
+    };
+    deleteProjectPhoto : shared (Text, Text) -> async {
       #ok : {
         key : {
           resourceId : Text;
@@ -419,6 +449,8 @@ persistent actor {
           // Re-enter the idempotent ICEStorage endpoint to reconcile safely.
           case (#publishing) { found := true };
           case (#cancelled) return #err("Photo publication was cancelled");
+          case (#revoking) return #err("Photo is being removed");
+          case (#deleted) return #err("Photo has been deleted");
           case (#pending) { found := true };
         };
       };
@@ -464,6 +496,60 @@ persistent actor {
     if (published and not stillOwned) #err("Wander object changed during publication; cleanup required")
     else if (published) #ok(true)
     else #err("Publication not confirmed; retry to reconcile")
+  };
+
+  // Remove a published project photo. ICEStorage revoke/delete endpoints are
+  // idempotent; durable #revoking survives upgrades and lost acknowledgements.
+  // Do not expose this photo while cleanup is pending.
+  public shared ({ caller }) func deleteOwnedWanderPhoto(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    var found = false;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+        switch (intent.state) {
+          case (#deleted) return #ok(true);
+          case (#published) { found := true };
+          case (#revoking) { found := true };
+          case (_) return #err("Photo is not published");
+        };
+      };
+    };
+    if (not found) return #err("Published photo not found");
+    // Stable tombstone first: public listing must stop before external awaits.
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+          { intent with state = #revoking }
+        } else intent
+      },
+    );
+    let revoked = try {
+      switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not revoked) return #err("Photo revocation not confirmed; retry cleanup");
+    let deleted = try {
+      switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not deleted) return #err("Photo deletion not confirmed; retry cleanup");
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller and intent.state == #revoking) {
+          { intent with state = #deleted }
+        } else intent
+      },
+    );
+    #ok(true)
   };
 
   public shared ({ caller }) func cancelOwnedWanderPhotoPublication(
