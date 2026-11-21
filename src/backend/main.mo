@@ -398,7 +398,7 @@ persistent actor {
   };
 
   // Project-backend publication, never a browser-side createResource call.
-  // Reserve the stable intent before await to prevent duplicate publication.
+  // Persist the stable intent before await; retries are idempotent at ICEStorage.
   public shared ({ caller }) func publishOwnedWanderPhoto(
     objectId : Text,
     storageObjectId : Text,
@@ -415,7 +415,9 @@ persistent actor {
       if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
         switch (intent.state) {
           case (#published) return #ok(true);
-          case (#publishing) return #err("Photo publication is in progress; retry later");
+          // A prior call may have been interrupted by an upgrade or lost reply.
+          // Re-enter the idempotent ICEStorage endpoint to reconcile safely.
+          case (#publishing) { found := true };
           case (#cancelled) return #err("Photo publication was cancelled");
           case (#pending) { found := true };
         };
