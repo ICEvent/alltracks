@@ -213,7 +213,7 @@ persistent actor {
           storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
         };
         status : { #active; #draft; #revoked; #deleted };
-        visibility : { #private; #unlisted; #public };
+        visibility : { #private; #unlisted; #public; #restricted };
         metadata : [(Text, Text)];
       };
       #err : {
