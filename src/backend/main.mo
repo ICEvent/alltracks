@@ -446,17 +446,24 @@ persistent actor {
         case (#err(_)) false;
       }
     } catch (_) { false };
+    // Revalidate ownership after the cross-canister await.
+    let stillOwned = switch (objectTrack(objectId)) {
+      case null false;
+      case (?item) item.createdBy == caller;
+    };
     // A failed/ambiguous response returns to pending. ICEStorage's publication
     // endpoint is idempotent, so the next call safely reconciles lost replies.
     wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) {
         if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller and intent.state == #publishing) {
-          { intent with state = if (published) #published else #pending }
+          { intent with state = if (published and stillOwned) #published else #pending }
         } else intent
       },
     );
-    if (published) #ok(true) else #err("Publication not confirmed; retry to reconcile")
+    if (published and not stillOwned) #err("Wander object changed during publication; cleanup required")
+    else if (published) #ok(true)
+    else #err("Publication not confirmed; retry to reconcile")
   };
 
   public shared ({ caller }) func cancelOwnedWanderPhotoPublication(
