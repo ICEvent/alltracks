@@ -52,6 +52,14 @@ persistent actor {
   };
   private var wanderPhotoPublicationIntents : [WanderPhotoPublicationIntent] = [];
   private let wanderPhotoIntentLimit : Nat = 5000;
+  public type WanderCheckpointPhotoBinding = {
+    objectId : Text;
+    timestamp : Time.Time;
+    author : Principal;
+    storageObjectId : Text;
+  };
+  private var wanderCheckpointPhotoBindings : [WanderCheckpointPhotoBinding] = [];
+
 
 
 
@@ -640,6 +648,88 @@ persistent actor {
     )
   };
 
+  // Only the Object owner may explicitly attach a published photo to an
+  // existing, uniquely identified Checkpoint. Guest upload is not enabled.
+  public shared ({ caller }) func bindOwnedWanderPhotoToCheckpoint(
+    objectId : Text, timestamp : Time.Time, author : Principal,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may bind photos");
+      };
+    };
+    let matching = List.filter<Types.CheckPoint>(checkpoints, func(cp) {
+      cp.trackId == objectId and cp.timestamp == timestamp and
+      cp.createdBy == author and cp.isPublic and
+      Text.startsWith(cp.note, #text guestCheckpointPrefix)
+    });
+    if (List.size(matching) != 1) return #err("Checkpoint not found or ambiguous");
+    let published = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+        intent.requestedBy == caller and intent.state == #published
+      },
+    ) != null;
+    if (not published) return #err("Published owned photo not found");
+    for (binding in wanderCheckpointPhotoBindings.vals()) {
+      if (binding.storageObjectId == storageObjectId) {
+        if (binding.objectId == objectId and binding.timestamp == timestamp and
+            binding.author == author) return #ok(true);
+        return #err("Photo already bound to another Checkpoint");
+      };
+    };
+    if (wanderCheckpointPhotoBindings.size() >= wanderPhotoIntentLimit) {
+      return #err("Checkpoint photo binding capacity reached");
+    };
+    wanderCheckpointPhotoBindings := Array.append<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      [{ objectId; timestamp; author; storageObjectId }],
+    );
+    #ok(true)
+  };
+
+  public query func listWanderCheckpointPhotos(
+    objectId : Text, timestamp : Time.Time, author : Principal,
+  ) : async [PublishedWanderPhotoBinding] {
+    switch (objectTrack(objectId)) {
+      case null return [];
+      case (?_) {};
+    };
+    let photos = Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) {
+        binding.objectId == objectId and binding.timestamp == timestamp and
+        binding.author == author
+      },
+    );
+    let active = Array.filter<WanderCheckpointPhotoBinding>(photos, func(binding) {
+      Array.find<WanderPhotoPublicationIntent>(wanderPhotoPublicationIntents, func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+        intent.state == #published
+      }) != null
+    });
+    Array.map<WanderCheckpointPhotoBinding, PublishedWanderPhotoBinding>(active, func(binding) {
+      let owner = switch (Array.find<WanderPhotoPublicationIntent>(wanderPhotoPublicationIntents, func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+        intent.state == #published
+      })) {
+        case (?intent) intent.requestedBy;
+        case null Principal.fromText("2vxsx-fae");
+      };
+      {
+        objectId;
+        storageObjectId = binding.storageObjectId;
+        storageOwner = owner;
+        storageId = "project-wander-photo";
+        resourceId = binding.storageObjectId;
+      }
+    })
+  };
+
   private func guestPolicy(id : Text) : ?(Principal, Bool) {
     for ((storedId, gateway, enabled) in objectGuestPolicies.vals()) {
       if (storedId == id) return ?(gateway, enabled);
@@ -751,6 +841,32 @@ persistent actor {
     // A legacy Track checkpoint isn't eligible, and ambiguous IDs must fail
     // closed rather than deleting multiple checkpoints.
     if (List.size(matching) != 1) return #err("Object check-in not found or ambiguous");
+    // Hide linked photos before removing the Checkpoint. ICEStorage cleanup
+    // remains retryable through deleteOwnedWanderPhoto; no external await here.
+    let linked = Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) {
+        binding.objectId == objectId and binding.timestamp == timestamp and
+        binding.author == author
+      },
+    );
+    for (binding in linked.vals()) {
+      wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+        wanderPhotoPublicationIntents,
+        func(intent) {
+          if (intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+              intent.state == #published) { { intent with state = #revoking } }
+          else intent
+        },
+      );
+    };
+    wanderCheckpointPhotoBindings := Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) {
+        not (binding.objectId == objectId and binding.timestamp == timestamp and
+             binding.author == author)
+      },
+    );
     checkpoints := List.filter<Types.CheckPoint>(
       checkpoints, func(cp) {
         not (
