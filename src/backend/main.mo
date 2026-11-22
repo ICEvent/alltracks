@@ -949,6 +949,35 @@ persistent actor {
         )
       }
     );
+    // Attempt ICEStorage revocation immediately after the durable tombstone.
+    // A failed remote call never restores the deleted Checkpoint. Its
+    // #revoking intent remains available for authenticated reconciliation.
+    for (binding in linked.vals()) {
+      let revoked = try {
+        switch (await wanderStorage.revokeProjectPhoto(binding.storageObjectId, objectId)) {
+          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+          case (#err(_)) false;
+        }
+      } catch (_) { false };
+      if (revoked) {
+        let deleted = try {
+          switch (await wanderStorage.deleteProjectPhoto(binding.storageObjectId, objectId)) {
+            case (#ok(resource)) resource.status == #deleted;
+            case (#err(_)) false;
+          }
+        } catch (_) { false };
+        if (deleted) {
+          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+            wanderPhotoPublicationIntents,
+            func(intent) {
+              if (intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+                  intent.state == #revoking) { { intent with state = #deleted } }
+              else intent
+            },
+          );
+        };
+      };
+    };
     // Keep replay receipts and daily guest quota: deletion must not allow
     // bypassing rate limits or replaying removed submissions.
     #ok(true)
