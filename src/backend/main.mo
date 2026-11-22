@@ -605,6 +605,12 @@ persistent actor {
       }
     } catch (_) { false };
     if (not deleted) return #err("Photo deletion not confirmed; retry cleanup");
+    // The storage object is deleted: remove its checkpoint reference as well.
+    // This also keeps replayed deletions from leaving dangling attachments.
+    wanderCheckpointPhotoBindings := Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) { not (binding.objectId == objectId and binding.storageObjectId == storageObjectId) },
+    );
     wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) {
@@ -880,6 +886,11 @@ persistent actor {
       },
     );
     let active = Array.filter<WanderCheckpointPhotoBinding>(photos, func(binding) {
+      // Do not return references to checkpoints already deleted.
+      List.find<Types.CheckPoint>(checkpoints, func(cp) {
+        cp.trackId == binding.objectId and cp.timestamp == binding.timestamp and
+        cp.createdBy == binding.author and cp.isPublic
+      }) != null and
       Array.find<WanderPhotoPublicationIntent>(wanderPhotoPublicationIntents, func(intent) {
         intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
         intent.state == #published
