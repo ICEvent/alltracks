@@ -621,6 +621,59 @@ persistent actor {
   private var wanderCleanupLastAttempt : Int = 0;
   private let wanderCleanupCooldownNs : Int = 5_000_000_000;
 
+  // Independent background recovery: ICP invokes heartbeat even when no
+  // Object owner has the browser open. Only durable #revoking intents qualify.
+  // At most one remote cleanup is admitted per minute, with no unbounded scan
+  // of remote storage and no anonymous endpoint that can select arbitrary IDs.
+  private var wanderCleanupHeartbeatLastAttempt : Int = 0;
+  private transient var wanderCleanupHeartbeatInFlight : Bool = false;
+  private let wanderCleanupHeartbeatIntervalNs : Int = 60_000_000_000;
+
+  system func heartbeat() : async () {
+    if (wanderCleanupHeartbeatInFlight) return;
+    let now = Time.now();
+    if (now < wanderCleanupHeartbeatLastAttempt or
+        now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatIntervalNs) return;
+    let pending = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) { intent.state == #revoking },
+    );
+    let intent = switch (pending) {
+      case null return;
+      case (?value) value;
+    };
+    wanderCleanupHeartbeatInFlight := true;
+    wanderCleanupHeartbeatLastAttempt := now;
+    try {
+      let revoked = try {
+        switch (await wanderStorage.revokeProjectPhoto(intent.storageObjectId, intent.objectId)) {
+          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+          case (#err(_)) false;
+        }
+      } catch (_) { false };
+      if (revoked) {
+        let deleted = try {
+          switch (await wanderStorage.deleteProjectPhoto(intent.storageObjectId, intent.objectId)) {
+            case (#ok(resource)) resource.status == #deleted;
+            case (#err(_)) false;
+          }
+        } catch (_) { false };
+        if (deleted) {
+          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+            wanderPhotoPublicationIntents,
+            func(current) {
+              if (current.objectId == intent.objectId and
+                  current.storageObjectId == intent.storageObjectId and
+                  current.state == #revoking) { { current with state = #deleted } }
+              else current
+            },
+          );
+        };
+      };
+    } catch (_) {};
+    wanderCleanupHeartbeatInFlight := false;
+  };
+
   // Authenticated, globally throttled cleanup for tombstoned photos.
   // No caller can select a live photo for deletion through this endpoint.
   // A signed-in user can advance recovery after a guest removes a Checkpoint.
