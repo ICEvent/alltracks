@@ -404,8 +404,14 @@ persistent actor {
     // One ICEStorage object may not be assigned to multiple Wander objects.
     for (intent in wanderPhotoPublicationIntents.vals()) {
       if (intent.storageObjectId == storageObjectId) {
-        if (intent.objectId == objectId and intent.requestedBy == caller and
-            intent.state == #pending) return #ok(intent);
+        if (intent.objectId == objectId and intent.requestedBy == caller) {
+          switch (intent.state) {
+            case (#pending) return #ok(intent);
+            case (#publishing) return #ok(intent);
+            case (#published) return #ok(intent);
+            case (_) return #err("Photo publication is cancelled or being deleted");
+          };
+        };
         return #err("Storage object already has a publication intent");
       };
     };
