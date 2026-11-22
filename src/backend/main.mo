@@ -626,6 +626,7 @@ persistent actor {
   // At most one remote cleanup is admitted per minute, with no unbounded scan
   // of remote storage and no anonymous endpoint that can select arbitrary IDs.
   private var wanderCleanupHeartbeatLastAttempt : Int = 0;
+  private var wanderCleanupHeartbeatCursor : Nat = 0;
   private transient var wanderCleanupHeartbeatInFlight : Bool = false;
   private let wanderCleanupHeartbeatIntervalNs : Int = 60_000_000_000;
 
@@ -634,14 +635,15 @@ persistent actor {
     let now = Time.now();
     if (now < wanderCleanupHeartbeatLastAttempt or
         now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatIntervalNs) return;
-    let pending = Array.find<WanderPhotoPublicationIntent>(
+    let pending = Array.filter<WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) { intent.state == #revoking },
     );
-    let intent = switch (pending) {
-      case null return;
-      case (?value) value;
-    };
+    if (pending.size() == 0) return;
+    // Round-robin prevents a permanently failing object from starving others.
+    let index = wanderCleanupHeartbeatCursor % pending.size();
+    let intent = pending[index];
+    wanderCleanupHeartbeatCursor := (index + 1) % pending.size();
     wanderCleanupHeartbeatInFlight := true;
     wanderCleanupHeartbeatLastAttempt := now;
     try {
