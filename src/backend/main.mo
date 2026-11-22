@@ -516,7 +516,36 @@ persistent actor {
         intent.requestedBy == caller and intent.state == #published
       },
     ) != null;
-    if (published and not stillPublishing) #err("Publication superseded; cleanup required")
+    if (published and not stillPublishing) {
+      // A Checkpoint can be removed while ICEStorage publication is in flight.
+      // Revoke again after publication completes, otherwise the earlier
+      // cleanup attempt may have raced ahead of the newly active Resource.
+      let revoked = try {
+        switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
+          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+          case (#err(_)) false;
+        }
+      } catch (_) { false };
+      if (revoked) {
+        let deleted = try {
+          switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+            case (#ok(resource)) resource.status == #deleted;
+            case (#err(_)) false;
+          }
+        } catch (_) { false };
+        if (deleted) {
+          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+            wanderPhotoPublicationIntents,
+            func(intent) {
+              if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+                  intent.state == #revoking) { { intent with state = #deleted } }
+              else intent
+            },
+          );
+        };
+      };
+      #err("Publication superseded; cleanup required")
+    }
     else if (published and not stillOwned) #err("Wander object changed during publication; cleanup required")
     else if (published) #ok(true)
     else #err("Publication not confirmed; retry to reconcile")
