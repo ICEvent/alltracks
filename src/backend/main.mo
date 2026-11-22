@@ -600,6 +600,11 @@ persistent actor {
     storageObjectId : Text,
   ) : async Result.Result<Bool, Text> {
     if (Principal.isAnonymous(caller)) return #err("Login required");
+    let owner = switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) item.createdBy;
+    };
+    if (caller != owner) return #err("Only the Wander owner can reconcile photo cleanup");
     let eligible = Array.find<WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) {
