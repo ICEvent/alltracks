@@ -41,6 +41,26 @@ persistent actor {
   private var objectCommentsClosed : [Text] = [];
   private var guestRequestReceipts : [(Text, Text, Int)] = [];
   private var guestDailyUsage : [(Text, Int, Nat, Int)] = [];
+  // Durable publication intents are NOT public photo bindings. They provide
+  // idempotency and a recovery inventory before ICEStorage manifest writes.
+  public type WanderPhotoPublicationIntent = {
+    objectId : Text;
+    storageObjectId : Text;
+    requestedBy : Principal;
+    requestedAt : Int;
+    state : { #pending; #publishing; #published; #revoking; #deleted; #cancelled };
+  };
+  private var wanderPhotoPublicationIntents : [WanderPhotoPublicationIntent] = [];
+  private let wanderPhotoIntentLimit : Nat = 5000;
+  public type WanderCheckpointPhotoBinding = {
+    objectId : Text;
+    timestamp : Time.Time;
+    author : Principal;
+    storageObjectId : Text;
+  };
+  private var wanderCheckpointPhotoBindings : [WanderCheckpointPhotoBinding] = [];
+
+
 
 
   private transient var userCredentials = HashMap.HashMap<Principal, Types.UserCredential>(1, Principal.equal, Principal.hash);
@@ -172,6 +192,717 @@ persistent actor {
     }
   };
 
+  // Stage 1: only the Wander object owner can request a photo grant.
+  // Public/guest check-in uploads need a separate abuse-resistant authorization path.
+  // Persist grant throttle across upgrades. Reserve before the cross-canister
+  // await so concurrent requests cannot bypass the per-user limit.
+  private var wanderPhotoGrantAttempts : [(Principal, Int)] = [];
+  private let wanderPhotoGrantCooldownNs : Int = 30_000_000_000;
+  private let wanderPhotoGrantRetentionNs : Int = 86_400_000_000_000;
+  private let wanderPhotoGrantMaxEntries : Nat = 5000;
+
+  public type WanderStorageObjectInfo = {
+    objectId : Text;
+    owner : Principal;
+    mimeType : Text;
+    size : Nat;
+    status : { #uploading; #complete; #aborted };
+  };
+
+  private let wanderStorage : actor {
+    issueProjectUploadGrant : shared (Principal, Text, Text, Nat, ?Blob) -> async {
+      #ok : Text;
+      #err : Text;
+    };
+    publishProjectPhoto : shared (Text, Text) -> async {
+      #ok : {
+        key : {
+          resourceId : Text;
+          storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
+        };
+        status : { #active; #draft; #revoked; #deleted };
+        visibility : { #private_; #unlisted; #public_; #restricted };
+        metadata : [(Text, Text)];
+      };
+      #err : {
+        #alreadyExists; #conflict : { currentRevision : Nat64 };
+        #forbidden; #internal : Text; #invalid : Text; #notFound;
+      };
+    };
+    revokeProjectPhoto : shared (Text, Text) -> async {
+      #ok : {
+        key : {
+          resourceId : Text;
+          storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
+        };
+        status : { #active; #draft; #revoked; #deleted };
+        visibility : { #private_; #unlisted; #public_; #restricted };
+        metadata : [(Text, Text)];
+      };
+      #err : {
+        #alreadyExists; #conflict : { currentRevision : Nat64 };
+        #forbidden; #internal : Text; #invalid : Text; #notFound;
+      };
+    };
+    deleteProjectPhoto : shared (Text, Text) -> async {
+      #ok : {
+        key : {
+          resourceId : Text;
+          storage : { storageId : Text; owner : { #principal : Principal; #group : { id : Text; namespace : Text } } };
+        };
+        status : { #active; #draft; #revoked; #deleted };
+        visibility : { #private_; #unlisted; #public_; #restricted };
+        metadata : [(Text, Text)];
+      };
+      #err : {
+        #alreadyExists; #conflict : { currentRevision : Nat64 };
+        #forbidden; #internal : Text; #invalid : Text; #notFound;
+      };
+    };
+    getProjectUploadedObjectInfo : shared query (Text, Text) -> async {
+      #ok : WanderStorageObjectInfo;
+      #err : {
+        #alreadyExists;
+        #conflict : { currentRevision : Nat64 };
+        #forbidden;
+        #internal : Text;
+        #invalid : Text;
+        #notFound;
+      };
+    };
+  } = actor ("5pqgi-saaaa-aaaal-aaavq-cai");
+
+  public shared ({ caller }) func requestWanderPhotoUploadGrant(
+    objectId : Text,
+    mimeType : Text,
+    size : Nat,
+  ) : async Result.Result<Text, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner can upload in this phase");
+      };
+    };
+    if (size == 0 or size > 10_485_760) return #err("Invalid photo size");
+    if (mimeType != "image/jpeg" and mimeType != "image/png" and
+        mimeType != "image/webp") return #err("Unsupported photo type");
+
+    let now = Time.now();
+    // Drop old reservations and enforce a bounded stable table.
+    let recent = Array.filter<(Principal, Int)>(
+      wanderPhotoGrantAttempts,
+      func(entry) { entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs },
+    );
+    for ((user, timestamp) in recent.vals()) {
+      if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
+        return #err("Please wait before requesting another photo upload");
+      };
+    };
+    if (recent.size() >= wanderPhotoGrantMaxEntries) {
+      return #err("Photo upload authorization is temporarily busy");
+    };
+    wanderPhotoGrantAttempts := Array.append<(Principal, Int)>(recent, [(caller, now)]);
+
+    try {
+      switch (await wanderStorage.issueProjectUploadGrant(
+        caller, objectId, mimeType, size, null,
+      )) {
+        case (#ok(grantId)) { #ok(grantId) };
+        case (#err(message)) { #err(message) };
+      }
+    } catch (_) {
+      #err("Photo authorization service unavailable")
+    }
+  };
+
+  // Read-only verification; this does NOT publish the photo or bind it to a
+  // Checkpoint. ObjectInfo is authoritative for upload completion and owner.
+  public shared ({ caller }) func verifyOwnedWanderPhotoUpload(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may verify uploads");
+      };
+    };
+    if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
+      return #err("Invalid storage object ID");
+    };
+    try {
+      switch (await wanderStorage.getProjectUploadedObjectInfo(storageObjectId, objectId)) {
+        case (#err(_)) { #err("Storage object unavailable") };
+        case (#ok(info)) {
+          // The object may have been removed or changed while awaiting
+          // ICEStorage. Never trust only the pre-await authorization check.
+          switch (objectTrack(objectId)) {
+            case null { return #err("Wander object no longer exists") };
+            case (?current) {
+              if (current.createdBy != caller) {
+                return #err("Wander object ownership changed");
+              };
+            };
+          };
+          if (info.objectId != storageObjectId or info.owner != caller) {
+            return #err("Storage object owner mismatch");
+          };
+          if (info.status != #complete) return #err("Photo upload is incomplete");
+          if (info.size == 0 or info.size > 10_485_760) {
+            return #err("Invalid stored photo size");
+          };
+          if (info.mimeType != "image/jpeg" and info.mimeType != "image/png" and
+              info.mimeType != "image/webp") {
+            return #err("Unsupported stored photo type");
+          };
+          #ok(true)
+        };
+      }
+    } catch (_) { #err("Photo verification service unavailable") }
+  };
+
+  // This reserves a durable, non-public publication intent. It does NOT
+  // assert that the upload is complete or that ICEStorage has published it.
+  public shared ({ caller }) func prepareOwnedWanderPhotoPublication(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<WanderPhotoPublicationIntent, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object not found") };
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may prepare publication");
+      };
+    };
+    if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
+      return #err("Invalid storage object ID");
+    };
+    // Confirm the upload before reserving an intent. A client-supplied
+    // object ID is never proof that ICEStorage contains a completed photo.
+    let verified = try {
+      switch (await wanderStorage.getProjectUploadedObjectInfo(storageObjectId, objectId)) {
+        case (#err(_)) { false };
+        case (#ok(info)) {
+          info.objectId == storageObjectId and info.owner == caller and
+          info.status == #complete and info.size > 0 and
+          info.size <= 10_485_760 and
+          (info.mimeType == "image/jpeg" or info.mimeType == "image/png" or
+           info.mimeType == "image/webp")
+        };
+      }
+    } catch (_) { false };
+    if (not verified) return #err("Completed owned photo not found in ICEStorage");
+    // Recheck after await; owner or object state may have changed.
+    switch (objectTrack(objectId)) {
+      case null { return #err("Wander object no longer exists") };
+      case (?current) {
+        if (current.createdBy != caller) return #err("Wander object ownership changed");
+      };
+    };
+    // One ICEStorage object may not be assigned to multiple Wander objects.
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.storageObjectId == storageObjectId) {
+        if (intent.objectId == objectId and intent.requestedBy == caller) {
+          switch (intent.state) {
+            case (#pending) return #ok(intent);
+            case (#publishing) return #ok(intent);
+            case (#published) return #ok(intent);
+            case (_) return #err("Photo publication is cancelled or being deleted");
+          };
+        };
+        return #err("Storage object already has a publication intent");
+      };
+    };
+    // A single account must not exhaust the global durable intent table.
+    var callerIntentCount : Nat = 0;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.requestedBy == caller and intent.state == #pending) {
+        callerIntentCount += 1;
+      };
+    };
+    if (callerIntentCount >= 20) {
+      return #err("Too many pending photo publications");
+    };
+    if (wanderPhotoPublicationIntents.size() >= wanderPhotoIntentLimit) {
+      return #err("Publication queue is full");
+    };
+    let intent : WanderPhotoPublicationIntent = {
+      objectId;
+      storageObjectId;
+      requestedBy = caller;
+      requestedAt = Time.now();
+      state = #pending;
+    };
+    wanderPhotoPublicationIntents := Array.append(
+      wanderPhotoPublicationIntents, [intent],
+    );
+    #ok(intent)
+  };
+
+  // Project-backend publication, never a browser-side createResource call.
+  // Persist the stable intent before await; retries are idempotent at ICEStorage.
+  public shared ({ caller }) func publishOwnedWanderPhoto(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may publish");
+      };
+    };
+    var found = false;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+        switch (intent.state) {
+          case (#published) return #ok(true);
+          // A prior call may have been interrupted by an upgrade or lost reply.
+          // Re-enter the idempotent ICEStorage endpoint to reconcile safely.
+          case (#publishing) { found := true };
+          case (#cancelled) return #err("Photo publication was cancelled");
+          case (#revoking) return #err("Photo is being removed");
+          case (#deleted) return #err("Photo has been deleted");
+          case (#pending) { found := true };
+        };
+      };
+    };
+    if (not found) return #err("Prepare publication first");
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+          { intent with state = #publishing }
+        } else intent
+      },
+    );
+    let published = try {
+      switch (await wanderStorage.publishProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) {
+          resource.status == #active and resource.visibility == #unlisted and
+          resource.key.resourceId == storageObjectId and
+          resource.key.storage.storageId == "project-wander-photo" and
+          resource.key.storage.owner == #principal(caller) and
+          Array.find<(Text, Text)>(resource.metadata, func(entry) {
+            entry.0 == "wanderObjectId" and entry.1 == objectId
+          }) != null
+        };
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    // Revalidate ownership after the cross-canister await.
+    let stillOwned = switch (objectTrack(objectId)) {
+      case null false;
+      case (?item) item.createdBy == caller;
+    };
+    // A failed/ambiguous response returns to pending. ICEStorage's publication
+    // endpoint is idempotent, so the next call safely reconciles lost replies.
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller and intent.state == #publishing) {
+          { intent with state = if (published and stillOwned) #published else #pending }
+        } else intent
+      },
+    );
+    // A concurrent delete may have tombstoned this intent while the
+    // publication call was in flight. Never report a live photo in that case.
+    let stillPublishing = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+        intent.requestedBy == caller and intent.state == #published
+      },
+    ) != null;
+    if (published and not stillPublishing) {
+      // A Checkpoint can be removed while ICEStorage publication is in flight.
+      // Revoke again after publication completes, otherwise the earlier
+      // cleanup attempt may have raced ahead of the newly active Resource.
+      let revoked = try {
+        switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
+          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+          case (#err(_)) false;
+        }
+      } catch (_) { false };
+      if (revoked) {
+        let deleted = try {
+          switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+            case (#ok(resource)) resource.status == #deleted;
+            case (#err(_)) false;
+          }
+        } catch (_) { false };
+        if (deleted) {
+          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+            wanderPhotoPublicationIntents,
+            func(intent) {
+              if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+                  intent.state == #revoking) { { intent with state = #deleted } }
+              else intent
+            },
+          );
+        };
+      };
+      #err("Publication superseded; cleanup required")
+    }
+    else if (published and not stillOwned) #err("Wander object changed during publication; cleanup required")
+    else if (published) #ok(true)
+    else #err("Publication not confirmed; retry to reconcile")
+  };
+
+  // Remove a published project photo. ICEStorage revoke/delete endpoints are
+  // idempotent; durable #revoking survives upgrades and lost acknowledgements.
+  // Do not expose this photo while cleanup is pending.
+  public shared ({ caller }) func deleteOwnedWanderPhoto(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    var found = false;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+        switch (intent.state) {
+          case (#deleted) {
+            // ICEStorage tombstones may precede physical byte reclamation.
+            // Replaying delete is idempotent and retries its reclaim path.
+            let tombstoneConfirmed = try {
+              switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+                case (#ok(resource)) resource.status == #deleted;
+                case (#err(_)) false;
+              }
+            } catch (_) { false };
+            if (tombstoneConfirmed) return #ok(true);
+            return #err("Photo tombstone replay failed; physical reclamation is not confirmed");
+          };
+          case (#published) { found := true };
+          case (#revoking) { found := true };
+          case (_) return #err("Photo is not published");
+        };
+      };
+    };
+    if (not found) return #err("Published photo not found");
+    // Stable tombstone first: public listing must stop before external awaits.
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
+          { intent with state = #revoking }
+        } else intent
+      },
+    );
+    let revoked = try {
+      switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not revoked) return #err("Photo revocation not confirmed; retry cleanup");
+    let deleted = try {
+      switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not deleted) return #err("Photo deletion not confirmed; retry cleanup");
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller and intent.state == #revoking) {
+          { intent with state = #deleted }
+        } else intent
+      },
+    );
+    #ok(true)
+  };
+
+  // Stable admission control prevents repeated cross-canister cleanup calls
+  // from consuming unbounded cycles. Reserve before the first await.
+  private var wanderCleanupLastAttempt : Int = 0;
+  private let wanderCleanupCooldownNs : Int = 5_000_000_000;
+
+  // Independent background recovery: ICP invokes heartbeat even when no
+  // Object owner has the browser open. Only durable #revoking intents qualify.
+  // At most one remote cleanup is admitted per minute, with no unbounded scan
+  // of remote storage and no anonymous endpoint that can select arbitrary IDs.
+  private var wanderCleanupHeartbeatLastAttempt : Int = 0;
+  private var wanderCleanupHeartbeatCursor : Nat = 0;
+  private transient var wanderCleanupHeartbeatInFlight : Bool = false;
+  private let wanderCleanupHeartbeatIntervalNs : Int = 60_000_000_000;
+
+  system func heartbeat() : async () {
+    if (wanderCleanupHeartbeatInFlight) return;
+    let now = Time.now();
+    if (now < wanderCleanupHeartbeatLastAttempt or
+        now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatIntervalNs) return;
+    let pending = Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) { intent.state == #revoking },
+    );
+    if (pending.size() == 0) return;
+    // Round-robin prevents a permanently failing object from starving others.
+    let index = wanderCleanupHeartbeatCursor % pending.size();
+    let intent = pending[index];
+    wanderCleanupHeartbeatCursor := (index + 1) % pending.size();
+    wanderCleanupHeartbeatInFlight := true;
+    wanderCleanupHeartbeatLastAttempt := now;
+    try {
+      let revoked = try {
+        switch (await wanderStorage.revokeProjectPhoto(intent.storageObjectId, intent.objectId)) {
+          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+          case (#err(_)) false;
+        }
+      } catch (_) { false };
+      if (revoked) {
+        let deleted = try {
+          switch (await wanderStorage.deleteProjectPhoto(intent.storageObjectId, intent.objectId)) {
+            case (#ok(resource)) resource.status == #deleted;
+            case (#err(_)) false;
+          }
+        } catch (_) { false };
+        if (deleted) {
+          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+            wanderPhotoPublicationIntents,
+            func(current) {
+              if (current.objectId == intent.objectId and
+                  current.storageObjectId == intent.storageObjectId and
+                  current.state == #revoking) { { current with state = #deleted } }
+              else current
+            },
+          );
+        };
+      };
+    } catch (_) {};
+    wanderCleanupHeartbeatInFlight := false;
+  };
+
+  // Authenticated, globally throttled cleanup for tombstoned photos.
+  // No caller can select a live photo for deletion through this endpoint.
+  // A signed-in user can advance recovery after a guest removes a Checkpoint.
+  public shared ({ caller }) func retryWanderPhotoCleanup(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    let owner = switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) item.createdBy;
+    };
+    if (caller != owner) return #err("Only the Wander owner can reconcile photo cleanup");
+    let eligible = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+        intent.state == #revoking
+      },
+    ) != null;
+    if (not eligible) return #err("No pending photo cleanup");
+    let now = Time.now();
+    if (now < wanderCleanupLastAttempt or
+        now - wanderCleanupLastAttempt < wanderCleanupCooldownNs) {
+      return #err("Cleanup is rate limited; retry later");
+    };
+    wanderCleanupLastAttempt := now;
+    let revoked = try {
+      switch (await wanderStorage.revokeProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not revoked) return #err("Photo revocation not confirmed; retry later");
+    let deleted = try {
+      switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+        case (#ok(resource)) resource.status == #deleted;
+        case (#err(_)) false;
+      }
+    } catch (_) { false };
+    if (not deleted) return #err("Photo deletion not confirmed; retry later");
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+            intent.state == #revoking) { { intent with state = #deleted } }
+        else intent
+      },
+    );
+    #ok(true)
+  };
+
+  // Bounded public work inventory: exposes only tombstoned storage IDs,
+  // never owners, unpublished uploads, or other private intent metadata.
+  public query func listPendingWanderPhotoCleanup(
+    objectId : Text,
+  ) : async [Text] {
+    let pending = Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) { intent.objectId == objectId and intent.state == #revoking },
+    );
+    let limited = if (pending.size() > 20) {
+      Array.tabulate<WanderPhotoPublicationIntent>(20, func(i) { pending[i] })
+    } else pending;
+    Array.map<WanderPhotoPublicationIntent, Text>(limited, func(intent) { intent.storageObjectId })
+  };
+
+  public shared ({ caller }) func cancelOwnedWanderPhotoPublication(
+    objectId : Text,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    var found = false;
+    var alreadyCancelled = false;
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+          intent.requestedBy == caller) {
+        if (intent.state == #pending) { found := true }
+        else if (intent.state == #cancelled) { alreadyCancelled := true }
+        else { return #err("Cannot cancel an in-progress or published photo") };
+      };
+    };
+    // Replayed cancellation after a lost acknowledgement is successful.
+    if (not found and alreadyCancelled) return #ok(true);
+    if (not found) return #err("Pending publication not found");
+    // Keep a tombstone to prevent a cancelled storage object from being
+    // rebound to another Wander object without explicit reconciliation.
+    wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+            intent.requestedBy == caller) {
+          { intent with state = #cancelled }
+        } else { intent }
+      },
+    );
+    #ok(true)
+  };
+
+  public shared query ({ caller }) func listMyWanderPhotoPublicationIntents(
+  ) : async [WanderPhotoPublicationIntent] {
+    if (Principal.isAnonymous(caller)) return [];
+    Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) { intent.requestedBy == caller },
+    )
+  };
+
+  // Public, canonical photo bindings are derived only from successfully
+  // published durable intents. Never expose pending uploads as readable photos.
+  public type PublishedWanderPhotoBinding = {
+    objectId : Text;
+    storageObjectId : Text;
+    storageOwner : Principal;
+    storageId : Text;
+    resourceId : Text;
+  };
+
+  public query func listPublishedWanderObjectPhotos(
+    objectId : Text,
+  ) : async [PublishedWanderPhotoBinding] {
+    switch (objectTrack(objectId)) {
+      case null return [];
+      case (?_) {};
+    };
+    let bindings = Array.filter<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.state == #published
+      },
+    );
+    Array.map<WanderPhotoPublicationIntent, PublishedWanderPhotoBinding>(
+      bindings,
+      func(intent) {
+        {
+          objectId = intent.objectId;
+          storageObjectId = intent.storageObjectId;
+          storageOwner = intent.requestedBy;
+          storageId = "project-wander-photo";
+          resourceId = intent.storageObjectId;
+        }
+      },
+    )
+  };
+
+  // Only the Object owner may explicitly attach a published photo to an
+  // existing, uniquely identified Checkpoint. Guest upload is not enabled.
+  public shared ({ caller }) func bindOwnedWanderPhotoToCheckpoint(
+    objectId : Text, timestamp : Time.Time, author : Principal,
+    storageObjectId : Text,
+  ) : async Result.Result<Bool, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner may bind photos");
+      };
+    };
+    let matching = List.filter<Types.CheckPoint>(checkpoints, func(cp) {
+      cp.trackId == objectId and cp.timestamp == timestamp and
+      cp.createdBy == author and cp.isPublic and
+      Text.startsWith(cp.note, #text guestCheckpointPrefix)
+    });
+    if (List.size(matching) != 1) return #err("Checkpoint not found or ambiguous");
+    let published = Array.find<WanderPhotoPublicationIntent>(
+      wanderPhotoPublicationIntents,
+      func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == storageObjectId and
+        intent.requestedBy == caller and intent.state == #published
+      },
+    ) != null;
+    if (not published) return #err("Published owned photo not found");
+    for (binding in wanderCheckpointPhotoBindings.vals()) {
+      if (binding.storageObjectId == storageObjectId) {
+        if (binding.objectId == objectId and binding.timestamp == timestamp and
+            binding.author == author) return #ok(true);
+        return #err("Photo already bound to another Checkpoint");
+      };
+    };
+    if (wanderCheckpointPhotoBindings.size() >= wanderPhotoIntentLimit) {
+      return #err("Checkpoint photo binding capacity reached");
+    };
+    wanderCheckpointPhotoBindings := Array.append<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      [{ objectId; timestamp; author; storageObjectId }],
+    );
+    #ok(true)
+  };
+
+  public query func listWanderCheckpointPhotos(
+    objectId : Text, timestamp : Time.Time, author : Principal,
+  ) : async [PublishedWanderPhotoBinding] {
+    switch (objectTrack(objectId)) {
+      case null return [];
+      case (?_) {};
+    };
+    let photos = Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) {
+        binding.objectId == objectId and binding.timestamp == timestamp and
+        binding.author == author
+      },
+    );
+    let active = Array.filter<WanderCheckpointPhotoBinding>(photos, func(binding) {
+      Array.find<WanderPhotoPublicationIntent>(wanderPhotoPublicationIntents, func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+        intent.state == #published
+      }) != null
+    });
+    Array.map<WanderCheckpointPhotoBinding, PublishedWanderPhotoBinding>(active, func(binding) {
+      let owner = switch (Array.find<WanderPhotoPublicationIntent>(wanderPhotoPublicationIntents, func(intent) {
+        intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+        intent.state == #published
+      })) {
+        case (?intent) intent.requestedBy;
+        case null Principal.fromText("2vxsx-fae");
+      };
+      {
+        objectId;
+        storageObjectId = binding.storageObjectId;
+        storageOwner = owner;
+        storageId = "project-wander-photo";
+        resourceId = binding.storageObjectId;
+      }
+    })
+  };
+
   private func guestPolicy(id : Text) : ?(Principal, Bool) {
     for ((storedId, gateway, enabled) in objectGuestPolicies.vals()) {
       if (storedId == id) return ?(gateway, enabled);
@@ -283,6 +1014,32 @@ persistent actor {
     // A legacy Track checkpoint isn't eligible, and ambiguous IDs must fail
     // closed rather than deleting multiple checkpoints.
     if (List.size(matching) != 1) return #err("Object check-in not found or ambiguous");
+    // Hide linked photos before removing the Checkpoint. ICEStorage cleanup
+    // remains retryable through deleteOwnedWanderPhoto; no external await here.
+    let linked = Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) {
+        binding.objectId == objectId and binding.timestamp == timestamp and
+        binding.author == author
+      },
+    );
+    for (binding in linked.vals()) {
+      wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+        wanderPhotoPublicationIntents,
+        func(intent) {
+          if (intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+              intent.state == #published) { { intent with state = #revoking } }
+          else intent
+        },
+      );
+    };
+    wanderCheckpointPhotoBindings := Array.filter<WanderCheckpointPhotoBinding>(
+      wanderCheckpointPhotoBindings,
+      func(binding) {
+        not (binding.objectId == objectId and binding.timestamp == timestamp and
+             binding.author == author)
+      },
+    );
     checkpoints := List.filter<Types.CheckPoint>(
       checkpoints, func(cp) {
         not (
@@ -292,6 +1049,35 @@ persistent actor {
         )
       }
     );
+    // Attempt ICEStorage revocation immediately after the durable tombstone.
+    // A failed remote call never restores the deleted Checkpoint. Its
+    // #revoking intent remains available for authenticated reconciliation.
+    for (binding in linked.vals()) {
+      let revoked = try {
+        switch (await wanderStorage.revokeProjectPhoto(binding.storageObjectId, objectId)) {
+          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
+          case (#err(_)) false;
+        }
+      } catch (_) { false };
+      if (revoked) {
+        let deleted = try {
+          switch (await wanderStorage.deleteProjectPhoto(binding.storageObjectId, objectId)) {
+            case (#ok(resource)) resource.status == #deleted;
+            case (#err(_)) false;
+          }
+        } catch (_) { false };
+        if (deleted) {
+          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
+            wanderPhotoPublicationIntents,
+            func(intent) {
+              if (intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
+                  intent.state == #revoking) { { intent with state = #deleted } }
+              else intent
+            },
+          );
+        };
+      };
+    };
     // Keep replay receipts and daily guest quota: deletion must not allow
     // bypassing rate limits or replaying removed submissions.
     #ok(true)
