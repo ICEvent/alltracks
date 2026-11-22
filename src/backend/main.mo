@@ -534,7 +534,18 @@ persistent actor {
     for (intent in wanderPhotoPublicationIntents.vals()) {
       if (intent.objectId == objectId and intent.storageObjectId == storageObjectId and intent.requestedBy == caller) {
         switch (intent.state) {
-          case (#deleted) return #ok(true);
+          case (#deleted) {
+            // ICEStorage tombstones may precede physical byte reclamation.
+            // Replaying delete is idempotent and retries its reclaim path.
+            let reclaimed = try {
+              switch (await wanderStorage.deleteProjectPhoto(storageObjectId, objectId)) {
+                case (#ok(resource)) resource.status == #deleted;
+                case (#err(_)) false;
+              }
+            } catch (_) { false };
+            if (reclaimed) return #ok(true);
+            return #err("Photo tombstoned; physical reclamation retry failed");
+          };
           case (#published) { found := true };
           case (#revoking) { found := true };
           case (_) return #err("Photo is not published");
