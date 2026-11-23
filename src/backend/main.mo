@@ -480,6 +480,80 @@ persistent actor {
     }
   };
 
+  // Probe B: await-only, with no persistent writes and no ICEStorage call.
+  public shared ({ caller }) func probeWanderPhotoGrantAwaitOnly(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner can run this probe");
+      };
+    };
+    logWanderGrantStage("probe-await-only-before");
+    try {
+      ignore await wanderDiagnosticManagement.raw_rand();
+      logWanderGrantStage("probe-await-only-after");
+      #ok({
+        heapBytes = Prim.rts_heap_size();
+        wasmMemoryBytes = Prim.rts_memory_size();
+      })
+    } catch (_) {
+      logWanderGrantStage("probe-await-only-catch");
+      #err("Diagnostic await-only call failed")
+    }
+  };
+
+  // Probe C: persist the same bounded reservation, but return without await.
+  // This consumes the normal 30-second owner cooldown.
+  public shared ({ caller }) func probeWanderPhotoGrantReservationOnly(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+    grantAttemptCount : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner can run this probe");
+      };
+    };
+    let now = Time.now();
+    var retainedCount : Nat = 0;
+    for ((user, timestamp) in wanderPhotoGrantAttempts.vals()) {
+      if (timestamp <= now and now - timestamp < wanderPhotoGrantRetentionNs) {
+        retainedCount += 1;
+        if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
+          return #err("Please wait before requesting another photo upload");
+        };
+      };
+    };
+    if (retainedCount >= wanderPhotoGrantMaxEntries) {
+      return #err("Photo upload authorization is temporarily busy");
+    };
+    logWanderGrantStage("probe-reservation-only-before");
+    let recent = Buffer.Buffer<(Principal, Int)>(retainedCount + 1);
+    for (entry in wanderPhotoGrantAttempts.vals()) {
+      if (entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs) {
+        recent.add(entry);
+      };
+    };
+    recent.add((caller, now));
+    wanderPhotoGrantAttempts := Buffer.toArray(recent);
+    logWanderGrantStage("probe-reservation-only-after");
+    #ok({
+      heapBytes = Prim.rts_heap_size();
+      wasmMemoryBytes = Prim.rts_memory_size();
+      grantAttemptCount = wanderPhotoGrantAttempts.size();
+    })
+  };
+
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
     mimeType : Text,
