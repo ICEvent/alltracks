@@ -422,6 +422,64 @@ persistent actor {
     );
   };
 
+  // Isolate the async message boundary without issuing an ICEStorage grant.
+  // Uses the management canister's raw_rand call to force a real cross-canister await.
+  // Owner-only; applies the same cooldown and bounded reservation as production.
+  private let wanderDiagnosticManagement : actor {
+    raw_rand : shared () -> async Blob;
+  } = actor ("aaaaa-aa");
+
+  public shared ({ caller }) func probeWanderPhotoGrantAsyncBoundary(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+    grantAttemptCount : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the object owner can run this probe");
+      };
+    };
+    let now = Time.now();
+    var retainedCount : Nat = 0;
+    for ((user, timestamp) in wanderPhotoGrantAttempts.vals()) {
+      if (timestamp <= now and now - timestamp < wanderPhotoGrantRetentionNs) {
+        retainedCount += 1;
+        if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
+          return #err("Please wait before requesting another photo upload");
+        };
+      };
+    };
+    if (retainedCount >= wanderPhotoGrantMaxEntries) {
+      return #err("Photo upload authorization is temporarily busy");
+    };
+    logWanderGrantStage("probe-async-before-reservation");
+    let recent = Buffer.Buffer<(Principal, Int)>(retainedCount + 1);
+    for (entry in wanderPhotoGrantAttempts.vals()) {
+      if (entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs) {
+        recent.add(entry);
+      };
+    };
+    recent.add((caller, now));
+    wanderPhotoGrantAttempts := Buffer.toArray(recent);
+    logWanderGrantStage("probe-async-before-await");
+    try {
+      ignore await wanderDiagnosticManagement.raw_rand();
+      logWanderGrantStage("probe-async-after-await");
+      #ok({
+        heapBytes = Prim.rts_heap_size();
+        wasmMemoryBytes = Prim.rts_memory_size();
+        grantAttemptCount = wanderPhotoGrantAttempts.size();
+      })
+    } catch (_) {
+      logWanderGrantStage("probe-async-catch");
+      #err("Diagnostic async boundary call failed")
+    }
+  };
+
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
     mimeType : Text,
