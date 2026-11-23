@@ -25,6 +25,8 @@ persistent actor {
   private  var trackathonEntries : [(Text, Types.Trackathon)] = [];
   private  var trackathonParticipantsEntries : [(Text, [(Principal, Types.TrackathonParticipant)])] = [];
   private  var tracks : List.List<Types.Track> = List.nil();
+  // Transient lookup only: durable `tracks` remains the upgrade source of truth.
+  private transient var tracksById = HashMap.HashMap<Text, Types.Track>(1, Text.equal, Text.hash);
   private  var trails : List.List<Types.Trail> = List.nil();
   private  var photos : List.List<Types.Photo> = List.nil();
   private  var savedPoints : List.List<Types.SavedPoint> = List.nil();
@@ -33,6 +35,21 @@ persistent actor {
   private  var checkpointComments : List.List<Types.CheckpointComment> = List.nil();
 
   private  var checkpoints : List.List<Types.CheckPoint> = List.nil();
+  // Transient, public-only track index. Stores references to existing records,
+  // not copies of photo bytes; durable checkpoints remain the source of truth.
+  private transient var publicCheckpointsByTrack =
+    HashMap.HashMap<Text, List.List<Types.CheckPoint>>(1, Text.equal, Text.hash);
+
+  private func indexPublicCheckpoint(cp : Types.CheckPoint) {
+    if (cp.isPublic) {
+      let existing = switch (publicCheckpointsByTrack.get(cp.trackId)) {
+        case (?items) items;
+        case null List.nil<Types.CheckPoint>();
+      };
+      publicCheckpointsByTrack.put(cp.trackId, List.push(cp, existing));
+    };
+  };
+
   private  var incidentPoints : List.List<Types.IncidentPoint> = List.nil();
   private  var userCredentialsEntries : [(Principal, Types.UserCredential)] = [];
   // Additive stable fields: compatible with the existing Track/Checkpoint model.
@@ -92,6 +109,28 @@ persistent actor {
   };
 
   system func postupgrade() {
+    // Avoid materializing the entire durable checkpoint list as an array
+    // during upgrade (which can trigger a large transient heap allocation).
+    // First build reversed per-track lists, then reverse each bucket once
+    // to preserve the original newest-first query order.
+    for (cp in List.toIter(checkpoints)) {
+      indexPublicCheckpoint(cp);
+    };
+    // Snapshot only the track IDs before updating HashMap values; never
+    // mutate the map while its entry iterator is active.
+    let indexedTrackIds = Iter.toArray(publicCheckpointsByTrack.keys());
+    for (trackId in indexedTrackIds.vals()) {
+      switch (publicCheckpointsByTrack.get(trackId)) {
+        case (?reversed) {
+          publicCheckpointsByTrack.put(trackId, List.reverse(reversed));
+        };
+        case null {};
+      };
+    };
+    // Preserve List.find's first-match behavior for legacy duplicate IDs.
+    for (track in List.toArray(tracks).vals()) {
+      if (tracksById.get(track.id) == null) tracksById.put(track.id, track);
+    };
     let groupsIter = Iter.fromArray<(Text, Types.Group)>(groupsEntries);
     let userStatsIter = Iter.fromArray<(Text, Types.UserStats)>(userStatsEntries);
 
@@ -181,7 +220,7 @@ persistent actor {
 
   private func objectTrack(id : Text) : ?Types.Track {
     if (not Text.startsWith(id, #text "obj-")) return null;
-    switch (List.find<Types.Track>(tracks, func(t) { t.id == id })) {
+    switch (tracksById.get(id)) {
       case (?track) {
         if (track.isPublic and track.trackType == #other and
             Text.startsWith(track.description, #text objectMetadataPrefix)) {
@@ -290,18 +329,23 @@ persistent actor {
 
     let now = Time.now();
     // Drop old reservations and enforce a bounded stable table.
+    // Reject throttled callers before allocating a filtered replacement table.
+    var retainedCount : Nat = 0;
+    for ((user, timestamp) in wanderPhotoGrantAttempts.vals()) {
+      if (timestamp <= now and now - timestamp < wanderPhotoGrantRetentionNs) {
+        retainedCount += 1;
+        if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
+          return #err("Please wait before requesting another photo upload");
+        };
+      };
+    };
+    if (retainedCount >= wanderPhotoGrantMaxEntries) {
+      return #err("Photo upload authorization is temporarily busy");
+    };
     let recent = Array.filter<(Principal, Int)>(
       wanderPhotoGrantAttempts,
       func(entry) { entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs },
     );
-    for ((user, timestamp) in recent.vals()) {
-      if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
-        return #err("Please wait before requesting another photo upload");
-      };
-    };
-    if (recent.size() >= wanderPhotoGrantMaxEntries) {
-      return #err("Photo upload authorization is temporarily busy");
-    };
     wanderPhotoGrantAttempts := Array.append<(Principal, Int)>(recent, [(caller, now)]);
 
     try {
@@ -635,51 +679,44 @@ persistent actor {
   private var wanderCleanupHeartbeatCursor : Nat = 0;
   private transient var wanderCleanupHeartbeatInFlight : Bool = false;
   private let wanderCleanupHeartbeatIntervalNs : Int = 60_000_000_000;
+  // Persist retry backoff across upgrades to avoid repeated paid cross-canister
+  // calls when ICEStorage is unavailable or low on cycles.
+  private var wanderCleanupHeartbeatFailures : Nat = 0;
+  private let wanderCleanupHeartbeatMaxBackoffNs : Int = 3_600_000_000_000;
 
-  system func heartbeat() : async () {
-    if (wanderCleanupHeartbeatInFlight) return;
-    let now = Time.now();
-    if (now < wanderCleanupHeartbeatLastAttempt or
-        now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatIntervalNs) return;
-    let pending = Array.filter<WanderPhotoPublicationIntent>(
-      wanderPhotoPublicationIntents,
-      func(intent) { intent.state == #revoking },
-    );
-    if (pending.size() == 0) return;
-    // Round-robin prevents a permanently failing object from starving others.
-    let index = wanderCleanupHeartbeatCursor % pending.size();
-    let intent = pending[index];
-    wanderCleanupHeartbeatCursor := (index + 1) % pending.size();
-    wanderCleanupHeartbeatInFlight := true;
-    wanderCleanupHeartbeatLastAttempt := now;
-    try {
-      let revoked = try {
-        switch (await wanderStorage.revokeProjectPhoto(intent.storageObjectId, intent.objectId)) {
-          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
-          case (#err(_)) false;
-        }
-      } catch (_) { false };
-      if (revoked) {
-        let deleted = try {
-          switch (await wanderStorage.deleteProjectPhoto(intent.storageObjectId, intent.objectId)) {
-            case (#ok(resource)) resource.status == #deleted;
-            case (#err(_)) false;
-          }
-        } catch (_) { false };
-        if (deleted) {
-          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
-            wanderPhotoPublicationIntents,
-            func(current) {
-              if (current.objectId == intent.objectId and
-                  current.storageObjectId == intent.storageObjectId and
-                  current.state == #revoking) { { current with state = #deleted } }
-              else current
-            },
-          );
-        };
+  private func wanderCleanupHeartbeatDelayNs() : Int {
+    // 1, 2, 4, 8, 16, 32, 60 minutes (capped).
+    var delay = wanderCleanupHeartbeatIntervalNs;
+    var steps : Nat = 0;
+    while (steps < wanderCleanupHeartbeatFailures and
+           delay < wanderCleanupHeartbeatMaxBackoffNs) {
+      delay := if (delay > wanderCleanupHeartbeatMaxBackoffNs / 2)
+        wanderCleanupHeartbeatMaxBackoffNs else delay * 2;
+      steps += 1;
+    };
+    delay
+  };
+
+  // No heartbeat or timer: photo tombstones are durable, but remote cleanup
+  // is initiated only by an authenticated object owner.
+  // This avoids recurring idle execution when no one is using Alltracks.
+  public shared query ({ caller }) func listMyPendingWanderPhotoCleanup(
+    objectId : Text,
+  ) : async Result.Result<[Text], Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the Wander owner may inspect cleanup");
       };
-    } catch (_) {};
-    wanderCleanupHeartbeatInFlight := false;
+    };
+    let pending = Buffer.Buffer<Text>(0);
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.state == #revoking) {
+        pending.add(intent.storageObjectId);
+      };
+    };
+    #ok(Buffer.toArray(pending))
   };
 
   // Authenticated, globally throttled cleanup for tombstoned photos.
@@ -1015,16 +1052,18 @@ persistent actor {
       case (?item) { item.createdBy };
     };
     if (caller != owner and caller != author) return #err("Not authorized");
-    let matching = List.filter<Types.CheckPoint>(
-      checkpoints, func(cp) {
-        cp.trackId == objectId and cp.timestamp == timestamp and
-        cp.createdBy == author and cp.isPublic and
-        Text.startsWith(cp.note, #text guestCheckpointPrefix)
-      }
-    );
-    // A legacy Track checkpoint isn't eligible, and ambiguous IDs must fail
-    // closed rather than deleting multiple checkpoints.
-    if (List.size(matching) != 1) return #err("Object check-in not found or ambiguous");
+    // Count matching checkpoints without allocating a duplicate linked list.
+    // Ambiguous legacy records still fail closed.
+    var matchingCount : Nat = 0;
+    for (cp in List.toIter(checkpoints)) {
+      if (cp.trackId == objectId and cp.timestamp == timestamp and
+          cp.createdBy == author and cp.isPublic and
+          Text.startsWith(cp.note, #text guestCheckpointPrefix)) {
+        matchingCount += 1;
+        if (matchingCount > 1) return #err("Object check-in not found or ambiguous");
+      };
+    };
+    if (matchingCount != 1) return #err("Object check-in not found or ambiguous");
     // Hide linked photos before removing the Checkpoint. ICEStorage cleanup
     // remains retryable through deleteOwnedWanderPhoto; no external await here.
     let linked = Array.filter<WanderCheckpointPhotoBinding>(
@@ -1034,13 +1073,18 @@ persistent actor {
         binding.author == author
       },
     );
-    for (binding in linked.vals()) {
+    // Apply all photo tombstones in a single pass. Previously this copied the
+    // entire durable intent array once per linked photo (O(photos * intents)).
+    if (linked.size() > 0) {
       wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
         wanderPhotoPublicationIntents,
         func(intent) {
-          if (intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
-              intent.state == #published) { { intent with state = #revoking } }
-          else intent
+          if (intent.objectId != objectId or intent.state != #published) return intent;
+          let isLinked = Array.find<WanderCheckpointPhotoBinding>(
+            linked,
+            func(binding) { binding.storageObjectId == intent.storageObjectId },
+          ) != null;
+          if (isLinked) { { intent with state = #revoking } } else intent
         },
       );
     };
@@ -1051,15 +1095,49 @@ persistent actor {
              binding.author == author)
       },
     );
-    checkpoints := List.filter<Types.CheckPoint>(
-      checkpoints, func(cp) {
-        not (
-          cp.trackId == objectId and cp.timestamp == timestamp and
-          cp.createdBy == author and cp.isPublic and
-          Text.startsWith(cp.note, #text guestCheckpointPrefix)
-        )
-      }
-    );
+    // Remove the one verified record without rebuilding the entire list.
+    // Retain the untouched suffix by structural sharing: allocation is
+    // proportional to the prefix before the deleted checkpoint, not N.
+    let prefix = Buffer.Buffer<Types.CheckPoint>(0);
+    var suffix = checkpoints;
+    var removed = false;
+    label findCheckpoint while (not removed) {
+      switch (suffix) {
+        case null { break findCheckpoint };
+        case (?(cp, rest)) {
+          if (cp.trackId == objectId and cp.timestamp == timestamp and
+              cp.createdBy == author and cp.isPublic and
+              Text.startsWith(cp.note, #text guestCheckpointPrefix)) {
+            suffix := rest;
+            removed := true;
+          } else {
+            prefix.add(cp);
+            suffix := rest;
+          };
+        };
+      };
+    };
+    // The earlier uniqueness check guarantees that a match exists.
+    // Rebuild only the traversed prefix, in reverse, onto the shared tail.
+    var prefixIndex = prefix.size();
+    while (prefixIndex > 0) {
+      prefixIndex -= 1;
+      suffix := List.push(prefix.get(prefixIndex), suffix);
+    };
+    checkpoints := suffix;
+    // The deletion above removes exactly one matching public checkpoint.
+    // Update only its track index rather than rebuilding all track indexes.
+    switch (publicCheckpointsByTrack.get(objectId)) {
+      case (?items) {
+        publicCheckpointsByTrack.put(objectId, List.filter<Types.CheckPoint>(
+          items, func(cp) {
+            not (cp.timestamp == timestamp and cp.createdBy == author and
+              Text.startsWith(cp.note, #text guestCheckpointPrefix))
+          },
+        ));
+      };
+      case null {};
+    };
     // Attempt ICEStorage revocation immediately after the durable tombstone.
     // A failed remote call never restores the deleted Checkpoint. Its
     // #revoking intent remains available for authenticated reconciliation.
@@ -1234,6 +1312,7 @@ persistent actor {
       keep, [(input.objectId, input.requestId, now)]
     );
     checkpoints := List.push<Types.CheckPoint>(cp, checkpoints);
+    indexPublicCheckpoint(cp);
     #ok(1)
   };
 
@@ -1288,13 +1367,10 @@ persistent actor {
   };
 
   public query func getCheckPointsByTrackId(trackId : Text) : async [Types.CheckPoint] {
-    let filtered = List.filter<Types.CheckPoint>(
-      checkpoints,
-      func(cp : Types.CheckPoint) : Bool {
-        cp.trackId == trackId and cp.isPublic;
-      },
-    );
-    List.toArray(filtered);
+    switch (publicCheckpointsByTrack.get(trackId)) {
+      case (?items) List.toArray(items);
+      case null [];
+    };
   };
 
   public query func getCheckpoints(filter : CheckpointFilter, startime : Time.Time, endtime : Time.Time) : async [Types.CheckPoint] {
@@ -1318,16 +1394,22 @@ persistent actor {
   };
 
   public query func getLatestCheckpoints() : async [Types.CheckPoint] {
-    let allCheckpoints = List.toArray(checkpoints);
-    let filtered = Array.filter<Types.CheckPoint>(allCheckpoints, func(cp) {
-      Text.notEqual(cp.note, "")
-    });
-    let sorted = Buffer.fromArray<Types.CheckPoint>(filtered);
-    sorted.sort(func(a, b) {
-      if (a.timestamp > b.timestamp) { #less } else if (a.timestamp < b.timestamp) { #greater } else { #equal }
-    }); 
-    let count = if (sorted.size() < 50) { sorted.size() } else { 50 };
-    Buffer.toArray(Buffer.subBuffer(sorted, 0, count));
+    // Keep only the newest 50 while scanning. Avoid allocating and sorting
+    // every checkpoint when the caller only needs a bounded result.
+    let newest = Buffer.Buffer<Types.CheckPoint>(50);
+    for (cp in List.toIter(checkpoints)) {
+      if (Text.notEqual(cp.note, "") and
+          (newest.size() < 50 or cp.timestamp > newest.get(newest.size() - 1).timestamp)) {
+        newest.add(cp);
+        newest.sort(func(a, b) {
+          if (a.timestamp > b.timestamp) { #less }
+          else if (a.timestamp < b.timestamp) { #greater }
+          else { #equal }
+        });
+        if (newest.size() > 50) { ignore newest.removeLast() };
+      };
+    };
+    Buffer.toArray(newest);
   };
 
   //=========================================================
@@ -1680,7 +1762,7 @@ persistent actor {
           not Text.startsWith(track.description, #text objectMetadataPrefix)) {
         return #err("Invalid object tracking record");
       };
-      switch (List.find<Types.Track>(tracks, func(t) { t.id == track.id })) {
+      switch (tracksById.get(track.id)) {
         case (?_) { return #err("Object ID already exists") };
         case null {};
       };
@@ -1702,6 +1784,7 @@ persistent actor {
       trackType = track.trackType;
     };
     tracks := List.push(newTrack, tracks);
+    tracksById.put(newTrack.id, newTrack);
 
     
     //update user stats
@@ -1732,7 +1815,7 @@ persistent actor {
   };
 
   public query func getTrack(id : Text) : async ?Types.Track {
-    List.find<Types.Track>(tracks, func(t) { t.id == id });
+    tracksById.get(id);
   };
 
   type TrackFilter = {
