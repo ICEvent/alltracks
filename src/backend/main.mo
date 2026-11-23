@@ -1462,6 +1462,9 @@ persistent actor {
       createdBy = msg.caller;
     };
     checkpoints := List.push(cp, checkpoints);
+    // Keep the transient public index consistent with the durable list.
+    // Guest check-ins already follow this path; direct checkpoints must too.
+    indexPublicCheckpoint(cp);
     #ok(1);
   };
 
