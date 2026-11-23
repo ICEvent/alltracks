@@ -412,6 +412,41 @@ persistent actor {
     })
   };
 
+  // Minimal query/update comparison, without object lookup or persistent writes.
+  // Restrict both to canister controllers explicitly listed for production diagnostics.
+  private func isWanderMemoryDiagnosticController(caller : Principal) : Bool {
+    let id = Principal.toText(caller);
+    id == "rgalm-g4oax-f3rww-4ludi-smdff-raxtd-sdh3x-dotw2-j74sf-u2sdw-eqe" or
+    id == "jj7fr-ctefk-gzu6l-eh2iy-k74uv-lptph-m27nv-6hzuv-cv33g-67xbw-4qe" or
+    id == "5pqgi-saaaa-aaaal-aaavq-cai"
+  };
+
+  public shared query ({ caller }) func probeWanderRuntimeMemoryQuery() : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+  }, Text> {
+    if (not isWanderMemoryDiagnosticController(caller)) {
+      return #err("Not authorized for runtime memory diagnostics");
+    };
+    #ok({
+      heapBytes = Prim.rts_heap_size();
+      wasmMemoryBytes = Prim.rts_memory_size();
+    })
+  };
+
+  public shared ({ caller }) func probeWanderRuntimeMemoryUpdate() : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+  }, Text> {
+    if (not isWanderMemoryDiagnosticController(caller)) {
+      return #err("Not authorized for runtime memory diagnostics");
+    };
+    #ok({
+      heapBytes = Prim.rts_heap_size();
+      wasmMemoryBytes = Prim.rts_memory_size();
+    })
+  };
+
   // Temporary production diagnostics. No object IDs, principals, or grant tokens in logs.
   private func logWanderGrantStage(stage : Text) {
     Debug.print(
