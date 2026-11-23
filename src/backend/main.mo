@@ -16,6 +16,7 @@ import Char "mo:base/Char";
 import Nat8 "mo:base/Nat8";
 
 import HashMap "mo:base/HashMap";
+import Prim "mo:prim";
 
 persistent actor {
   private  var nextTrailId : Nat = 1;
@@ -323,6 +324,41 @@ persistent actor {
       };
     };
   } = actor ("5pqgi-saaaa-aaaal-aaavq-cai");
+
+  // Retain the previous mainnet persistent actor field across upgrades.
+  // Removing it without an explicit stable migration triggers M0169.
+  private let wanderDiagnosticManagement : actor {
+    raw_rand : shared () -> async Blob;
+  } = actor ("aaaaa-aa");
+
+  // Preserve the existing mainnet Candid query method for clients.
+  public shared query ({ caller }) func inspectWanderPhotoGrantMemory(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+    grantAttemptCount : Nat;
+    activeGrantAttemptCount : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the Wander owner can inspect grant memory");
+      };
+    };
+    let now = Time.now();
+    var active : Nat = 0;
+    for ((_, timestamp) in wanderPhotoGrantAttempts.vals()) {
+      if (timestamp <= now and now - timestamp < wanderPhotoGrantRetentionNs) active += 1;
+    };
+    #ok({
+      heapBytes = Prim.rts_heap_size();
+      wasmMemoryBytes = Prim.rts_memory_size();
+      grantAttemptCount = wanderPhotoGrantAttempts.size();
+      activeGrantAttemptCount = active;
+    })
+  };
 
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
