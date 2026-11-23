@@ -369,6 +369,46 @@ persistent actor {
     })
   };
 
+  // Diagnostic-only allocation probe: performs the grant scan and temporary
+  // compaction without persisting a reservation or contacting ICEStorage.
+  // Compare with probeWanderPhotoGrantUpdate to isolate allocation overhead.
+  public shared ({ caller }) func probeWanderPhotoGrantAllocation(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBeforeBytes : Nat;
+    heapAfterBytes : Nat;
+    wasmBeforeBytes : Nat;
+    wasmAfterBytes : Nat;
+    retainedCount : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the Wander owner can inspect grant memory");
+      };
+    };
+    let heapBefore = Prim.rts_heap_size();
+    let wasmBefore = Prim.rts_memory_size();
+    let now = Time.now();
+    let recent = Buffer.Buffer<(Principal, Int)>(wanderPhotoGrantAttempts.size() + 1);
+    for (entry in wanderPhotoGrantAttempts.vals()) {
+      if (entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs) {
+        recent.add(entry);
+      };
+    };
+    let retained = recent.size();
+    recent.add((caller, now));
+    ignore Buffer.toArray(recent);
+    #ok({
+      heapBeforeBytes = heapBefore;
+      heapAfterBytes = Prim.rts_heap_size();
+      wasmBeforeBytes = wasmBefore;
+      wasmAfterBytes = Prim.rts_memory_size();
+      retainedCount = retained;
+    })
+  };
+
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
     mimeType : Text,
