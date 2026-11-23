@@ -1072,13 +1072,18 @@ persistent actor {
         binding.author == author
       },
     );
-    for (binding in linked.vals()) {
+    // Apply all photo tombstones in a single pass. Previously this copied the
+    // entire durable intent array once per linked photo (O(photos * intents)).
+    if (linked.size() > 0) {
       wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
         wanderPhotoPublicationIntents,
         func(intent) {
-          if (intent.objectId == objectId and intent.storageObjectId == binding.storageObjectId and
-              intent.state == #published) { { intent with state = #revoking } }
-          else intent
+          if (intent.objectId != objectId or intent.state != #published) return intent;
+          let isLinked = Array.find<WanderCheckpointPhotoBinding>(
+            linked,
+            func(binding) { binding.storageObjectId == intent.storageObjectId },
+          ) != null;
+          if (isLinked) { { intent with state = #revoking } } else intent
         },
       );
     };
