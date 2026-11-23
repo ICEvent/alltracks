@@ -129,7 +129,9 @@ persistent actor {
       };
     };
     // Preserve List.find's first-match behavior for legacy duplicate IDs.
-    for (track in List.toArray(tracks).vals()) {
+    // Iterate the durable list directly: avoid a full transient Track array
+    // during upgrade, especially when Track descriptions are large.
+    for (track in List.toIter(tracks)) {
       if (tracksById.get(track.id) == null) tracksById.put(track.id, track);
     };
     let groupsIter = Iter.fromArray<(Text, Types.Group)>(groupsEntries);
