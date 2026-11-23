@@ -539,6 +539,7 @@ persistent actor {
           }
         } catch (_) { false };
         if (deleted) {
+          cleanupSucceeded := true;
           wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
             wanderPhotoPublicationIntents,
             func(intent) {
@@ -640,12 +641,29 @@ persistent actor {
   private var wanderCleanupHeartbeatCursor : Nat = 0;
   private transient var wanderCleanupHeartbeatInFlight : Bool = false;
   private let wanderCleanupHeartbeatIntervalNs : Int = 60_000_000_000;
+  // Persist retry backoff across upgrades to avoid repeated paid cross-canister
+  // calls when ICEStorage is unavailable or low on cycles.
+  private var wanderCleanupHeartbeatFailures : Nat = 0;
+  private let wanderCleanupHeartbeatMaxBackoffNs : Int = 3_600_000_000_000;
+
+  private func wanderCleanupHeartbeatDelayNs() : Int {
+    // 1, 2, 4, 8, 16, 32, 60 minutes (capped).
+    var delay = wanderCleanupHeartbeatIntervalNs;
+    var steps : Nat = 0;
+    while (steps < wanderCleanupHeartbeatFailures and
+           delay < wanderCleanupHeartbeatMaxBackoffNs) {
+      delay := if (delay > wanderCleanupHeartbeatMaxBackoffNs / 2)
+        wanderCleanupHeartbeatMaxBackoffNs else delay * 2;
+      steps += 1;
+    };
+    delay
+  };
 
   system func heartbeat() : async () {
     if (wanderCleanupHeartbeatInFlight) return;
     let now = Time.now();
     if (now < wanderCleanupHeartbeatLastAttempt or
-        now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatIntervalNs) return;
+        now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatDelayNs()) return;
     // Find one pending cleanup without allocating a full filtered copy of
     // the durable intent table on every heartbeat.
     let count = wanderPhotoPublicationIntents.size();
@@ -666,6 +684,7 @@ persistent actor {
     wanderCleanupHeartbeatCursor := nextCursor;
     wanderCleanupHeartbeatInFlight := true;
     wanderCleanupHeartbeatLastAttempt := now;
+    var cleanupSucceeded = false;
     try {
       let revoked = try {
         switch (await wanderStorage.revokeProjectPhoto(intent.storageObjectId, intent.objectId)) {
@@ -693,6 +712,11 @@ persistent actor {
         };
       };
     } catch (_) {};
+    if (cleanupSucceeded) {
+      wanderCleanupHeartbeatFailures := 0;
+    } else if (wanderCleanupHeartbeatFailures < 6) {
+      wanderCleanupHeartbeatFailures += 1;
+    };
     wanderCleanupHeartbeatInFlight := false;
   };
 
