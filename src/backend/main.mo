@@ -25,6 +25,8 @@ persistent actor {
   private  var trackathonEntries : [(Text, Types.Trackathon)] = [];
   private  var trackathonParticipantsEntries : [(Text, [(Principal, Types.TrackathonParticipant)])] = [];
   private  var tracks : List.List<Types.Track> = List.nil();
+  // Transient lookup only: durable `tracks` remains the upgrade source of truth.
+  private transient var tracksById = HashMap.HashMap<Text, Types.Track>(1, Text.equal, Text.hash);
   private  var trails : List.List<Types.Trail> = List.nil();
   private  var photos : List.List<Types.Photo> = List.nil();
   private  var savedPoints : List.List<Types.SavedPoint> = List.nil();
@@ -92,6 +94,10 @@ persistent actor {
   };
 
   system func postupgrade() {
+    // Preserve List.find's first-match behavior for legacy duplicate IDs.
+    for (track in List.toArray(tracks).vals()) {
+      if (tracksById.get(track.id) == null) tracksById.put(track.id, track);
+    };
     let groupsIter = Iter.fromArray<(Text, Types.Group)>(groupsEntries);
     let userStatsIter = Iter.fromArray<(Text, Types.UserStats)>(userStatsEntries);
 
@@ -181,7 +187,7 @@ persistent actor {
 
   private func objectTrack(id : Text) : ?Types.Track {
     if (not Text.startsWith(id, #text "obj-")) return null;
-    switch (List.find<Types.Track>(tracks, func(t) { t.id == id })) {
+    switch (tracksById.get(id)) {
       case (?track) {
         if (track.isPublic and track.trackType == #other and
             Text.startsWith(track.description, #text objectMetadataPrefix)) {
@@ -1731,7 +1737,7 @@ persistent actor {
           not Text.startsWith(track.description, #text objectMetadataPrefix)) {
         return #err("Invalid object tracking record");
       };
-      switch (List.find<Types.Track>(tracks, func(t) { t.id == track.id })) {
+      switch (tracksById.get(track.id)) {
         case (?_) { return #err("Object ID already exists") };
         case null {};
       };
@@ -1753,6 +1759,7 @@ persistent actor {
       trackType = track.trackType;
     };
     tracks := List.push(newTrack, tracks);
+    tracksById.put(newTrack.id, newTrack);
 
     
     //update user stats
@@ -1783,7 +1790,7 @@ persistent actor {
   };
 
   public query func getTrack(id : Text) : async ?Types.Track {
-    List.find<Types.Track>(tracks, func(t) { t.id == id });
+    tracksById.get(id);
   };
 
   type TrackFilter = {
