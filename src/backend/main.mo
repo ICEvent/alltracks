@@ -345,6 +345,30 @@ persistent actor {
     })
   };
 
+  // Diagnostic update: same authenticated Object lookup as the real grant,
+  // but no persistent mutation and no ICEStorage call. Compare with the
+  // query probe to isolate update-message/GC overhead.
+  public shared ({ caller }) func probeWanderPhotoGrantUpdate(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+    grantAttemptCount : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the Wander owner can inspect grant memory");
+      };
+    };
+    #ok({
+      heapBytes = Prim.rts_heap_size();
+      wasmMemoryBytes = Prim.rts_memory_size();
+      grantAttemptCount = wanderPhotoGrantAttempts.size();
+    })
+  };
+
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
     mimeType : Text,
