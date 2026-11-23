@@ -290,18 +290,23 @@ persistent actor {
 
     let now = Time.now();
     // Drop old reservations and enforce a bounded stable table.
+    // Reject throttled callers before allocating a filtered replacement table.
+    var retainedCount : Nat = 0;
+    for ((user, timestamp) in wanderPhotoGrantAttempts.vals()) {
+      if (timestamp <= now and now - timestamp < wanderPhotoGrantRetentionNs) {
+        retainedCount += 1;
+        if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
+          return #err("Please wait before requesting another photo upload");
+        };
+      };
+    };
+    if (retainedCount >= wanderPhotoGrantMaxEntries) {
+      return #err("Photo upload authorization is temporarily busy");
+    };
     let recent = Array.filter<(Principal, Int)>(
       wanderPhotoGrantAttempts,
       func(entry) { entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs },
     );
-    for ((user, timestamp) in recent.vals()) {
-      if (user == caller and now - timestamp < wanderPhotoGrantCooldownNs) {
-        return #err("Please wait before requesting another photo upload");
-      };
-    };
-    if (recent.size() >= wanderPhotoGrantMaxEntries) {
-      return #err("Photo upload authorization is temporarily busy");
-    };
     wanderPhotoGrantAttempts := Array.append<(Principal, Int)>(recent, [(caller, now)]);
 
     try {
@@ -641,15 +646,24 @@ persistent actor {
     let now = Time.now();
     if (now < wanderCleanupHeartbeatLastAttempt or
         now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatIntervalNs) return;
-    let pending = Array.filter<WanderPhotoPublicationIntent>(
-      wanderPhotoPublicationIntents,
-      func(intent) { intent.state == #revoking },
-    );
-    if (pending.size() == 0) return;
-    // Round-robin prevents a permanently failing object from starving others.
-    let index = wanderCleanupHeartbeatCursor % pending.size();
-    let intent = pending[index];
-    wanderCleanupHeartbeatCursor := (index + 1) % pending.size();
+    // Find one pending cleanup without allocating a full filtered copy of
+    // the durable intent table on every heartbeat.
+    let count = wanderPhotoPublicationIntents.size();
+    if (count == 0) return;
+    var selected : ?WanderPhotoPublicationIntent = null;
+    var nextCursor = wanderCleanupHeartbeatCursor % count;
+    var scanned : Nat = 0;
+    while (scanned < count and selected == null) {
+      let candidate = wanderPhotoPublicationIntents[nextCursor];
+      nextCursor := (nextCursor + 1) % count;
+      if (candidate.state == #revoking) selected := ?candidate;
+      scanned += 1;
+    };
+    let intent = switch (selected) {
+      case null return;
+      case (?value) value;
+    };
+    wanderCleanupHeartbeatCursor := nextCursor;
     wanderCleanupHeartbeatInFlight := true;
     wanderCleanupHeartbeatLastAttempt := now;
     try {
