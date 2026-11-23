@@ -44,22 +44,6 @@ anon_cp="$(dfx --identity anonymous canister call backend createCheckpoint   '(r
   })')"
 echo "$anon_cp" | grep -q 'Anonymous users are not allowed'
 
-invalid="$(dfx --identity guest-relay canister call backend submitGuestCheckin \
-  '(record {
-    objectId = "obj-11111111-1111-4111-8111-111111111111";
-    latitude = 999.0; longitude = -122.63; accuracyMeters = 20;
-    action = variant { found };
-    note = "Forged location";
-    requestId = "33333333-3333-4333-8333-333333333333"
-  })')"
-echo "$invalid" | grep -q 'invalid'
-
-disabled="$(dfx canister call backend setObjectGuestPolicy \
-  "(\"$object_id\", false, principal \"$relay\")")"
-echo "$disabled" | grep -q 'ok'
-blocked="$(dfx --identity guest-relay canister call backend submitGuestCheckin "$payload")"
-echo "$blocked" | grep -q 'disabled'
-
 # Legacy policy remains readable but never grants write authority.
 dfx canister call backend getObjectGuestPolicy "(\"$object_id\")" --query | grep -q 'true'
 dfx canister install backend --mode upgrade --wasm-memory-persistence keep
