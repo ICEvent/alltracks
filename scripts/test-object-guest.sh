@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "Guest ACL test failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+set -x
 
 # Local-only integration exercise for the EXISTING backend, never mainnet.
 object_id="obj-11111111-1111-4111-8111-111111111111"
