@@ -16,6 +16,7 @@ import Char "mo:base/Char";
 import Nat8 "mo:base/Nat8";
 
 import HashMap "mo:base/HashMap";
+import Prim "mo:prim";
 
 persistent actor {
   private  var nextTrailId : Nat = 1;
@@ -311,6 +312,39 @@ persistent actor {
     };
   } = actor ("5pqgi-saaaa-aaaal-aaavq-cai");
 
+  // On-demand diagnostic only: no timer, no writes, no ICEStorage call.
+  // Restricted to the owner of the specified Object. Helps distinguish
+  // normal entry-path heap growth from the grant reservation/cross-canister path.
+  public shared query ({ caller }) func inspectWanderPhotoGrantMemory(
+    objectId : Text,
+  ) : async Result.Result<{
+    heapBytes : Nat;
+    wasmMemoryBytes : Nat;
+    grantAttemptCount : Nat;
+    activeGrantAttemptCount : Nat;
+  }, Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the Wander owner can inspect grant memory");
+      };
+    };
+    let now = Time.now();
+    var active : Nat = 0;
+    for ((_, timestamp) in wanderPhotoGrantAttempts.vals()) {
+      if (timestamp <= now and now - timestamp < wanderPhotoGrantRetentionNs) {
+        active += 1;
+      };
+    };
+    #ok({
+      heapBytes = Prim.rts_heap_size();
+      wasmMemoryBytes = Prim.rts_memory_size();
+      grantAttemptCount = wanderPhotoGrantAttempts.size();
+      activeGrantAttemptCount = active;
+    })
+  };
+
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
     mimeType : Text,
@@ -342,11 +376,15 @@ persistent actor {
     if (retainedCount >= wanderPhotoGrantMaxEntries) {
       return #err("Photo upload authorization is temporarily busy");
     };
-    let recent = Array.filter<(Principal, Int)>(
-      wanderPhotoGrantAttempts,
-      func(entry) { entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs },
-    );
-    wanderPhotoGrantAttempts := Array.append<(Principal, Int)>(recent, [(caller, now)]);
+    // One bounded allocation rather than Array.filter followed by Array.append.
+    let recent = Buffer.Buffer<(Principal, Int)>(retainedCount + 1);
+    for (entry in wanderPhotoGrantAttempts.vals()) {
+      if (entry.1 <= now and now - entry.1 < wanderPhotoGrantRetentionNs) {
+        recent.add(entry);
+      };
+    };
+    recent.add((caller, now));
+    wanderPhotoGrantAttempts := Buffer.toArray(recent);
 
     try {
       switch (await wanderStorage.issueProjectUploadGrant(
