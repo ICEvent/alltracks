@@ -116,8 +116,16 @@ persistent actor {
     for (cp in List.toIter(checkpoints)) {
       indexPublicCheckpoint(cp);
     };
-    for ((trackId, reversed) in publicCheckpointsByTrack.entries()) {
-      publicCheckpointsByTrack.put(trackId, List.reverse(reversed));
+    // Snapshot only the track IDs before updating HashMap values; never
+    // mutate the map while its entry iterator is active.
+    let indexedTrackIds = Iter.toArray(publicCheckpointsByTrack.keys());
+    for (trackId in indexedTrackIds.vals()) {
+      switch (publicCheckpointsByTrack.get(trackId)) {
+        case (?reversed) {
+          publicCheckpointsByTrack.put(trackId, List.reverse(reversed));
+        };
+        case null {};
+      };
     };
     // Preserve List.find's first-match behavior for legacy duplicate IDs.
     for (track in List.toArray(tracks).vals()) {
