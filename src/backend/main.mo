@@ -1362,16 +1362,22 @@ persistent actor {
   };
 
   public query func getLatestCheckpoints() : async [Types.CheckPoint] {
-    let allCheckpoints = List.toArray(checkpoints);
-    let filtered = Array.filter<Types.CheckPoint>(allCheckpoints, func(cp) {
-      Text.notEqual(cp.note, "")
-    });
-    let sorted = Buffer.fromArray<Types.CheckPoint>(filtered);
-    sorted.sort(func(a, b) {
-      if (a.timestamp > b.timestamp) { #less } else if (a.timestamp < b.timestamp) { #greater } else { #equal }
-    }); 
-    let count = if (sorted.size() < 50) { sorted.size() } else { 50 };
-    Buffer.toArray(Buffer.subBuffer(sorted, 0, count));
+    // Keep only the newest 50 while scanning. Avoid allocating and sorting
+    // every checkpoint when the caller only needs a bounded result.
+    let newest = Buffer.Buffer<Types.CheckPoint>(50);
+    for (cp in List.toIter(checkpoints)) {
+      if (Text.notEqual(cp.note, "") and
+          (newest.size() < 50 or cp.timestamp > newest.get(newest.size() - 1).timestamp)) {
+        newest.add(cp);
+        newest.sort(func(a, b) {
+          if (a.timestamp > b.timestamp) { #less }
+          else if (a.timestamp < b.timestamp) { #greater }
+          else { #equal }
+        });
+        if (newest.size() > 50) { ignore newest.removeLast() };
+      };
+    };
+    Buffer.toArray(newest);
   };
 
   //=========================================================
