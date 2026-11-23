@@ -697,66 +697,26 @@ persistent actor {
     delay
   };
 
-  system func heartbeat() : async () {
-    if (wanderCleanupHeartbeatInFlight) return;
-    let now = Time.now();
-    if (now < wanderCleanupHeartbeatLastAttempt or
-        now - wanderCleanupHeartbeatLastAttempt < wanderCleanupHeartbeatDelayNs()) return;
-    // Find one pending cleanup without allocating a full filtered copy of
-    // the durable intent table on every heartbeat.
-    let count = wanderPhotoPublicationIntents.size();
-    if (count == 0) return;
-    var selected : ?WanderPhotoPublicationIntent = null;
-    var nextCursor = wanderCleanupHeartbeatCursor % count;
-    var scanned : Nat = 0;
-    while (scanned < count and selected == null) {
-      let candidate = wanderPhotoPublicationIntents[nextCursor];
-      nextCursor := (nextCursor + 1) % count;
-      if (candidate.state == #revoking) selected := ?candidate;
-      scanned += 1;
-    };
-    let intent = switch (selected) {
-      case null return;
-      case (?value) value;
-    };
-    wanderCleanupHeartbeatCursor := nextCursor;
-    wanderCleanupHeartbeatInFlight := true;
-    wanderCleanupHeartbeatLastAttempt := now;
-    var cleanupSucceeded = false;
-    try {
-      let revoked = try {
-        switch (await wanderStorage.revokeProjectPhoto(intent.storageObjectId, intent.objectId)) {
-          case (#ok(resource)) resource.status == #revoked or resource.status == #deleted;
-          case (#err(_)) false;
-        }
-      } catch (_) { false };
-      if (revoked) {
-        let deleted = try {
-          switch (await wanderStorage.deleteProjectPhoto(intent.storageObjectId, intent.objectId)) {
-            case (#ok(resource)) resource.status == #deleted;
-            case (#err(_)) false;
-          }
-        } catch (_) { false };
-        if (deleted) {
-          cleanupSucceeded := true;
-          wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
-            wanderPhotoPublicationIntents,
-            func(current) {
-              if (current.objectId == intent.objectId and
-                  current.storageObjectId == intent.storageObjectId and
-                  current.state == #revoking) { { current with state = #deleted } }
-              else current
-            },
-          );
-        };
+  // No heartbeat or timer: photo tombstones are durable, but remote cleanup
+  // is initiated only by an authenticated object owner.
+  // This avoids recurring idle execution when no one is using Alltracks.
+  public shared query ({ caller }) func listMyPendingWanderPhotoCleanup(
+    objectId : Text,
+  ) : async Result.Result<[Text], Text> {
+    if (Principal.isAnonymous(caller)) return #err("Login required");
+    switch (objectTrack(objectId)) {
+      case null return #err("Wander object not found");
+      case (?item) {
+        if (item.createdBy != caller) return #err("Only the Wander owner may inspect cleanup");
       };
-    } catch (_) {};
-    if (cleanupSucceeded) {
-      wanderCleanupHeartbeatFailures := 0;
-    } else if (wanderCleanupHeartbeatFailures < 6) {
-      wanderCleanupHeartbeatFailures += 1;
     };
-    wanderCleanupHeartbeatInFlight := false;
+    let pending = Buffer.Buffer<Text>(0);
+    for (intent in wanderPhotoPublicationIntents.vals()) {
+      if (intent.objectId == objectId and intent.state == #revoking) {
+        pending.add(intent.storageObjectId);
+      };
+    };
+    #ok(Buffer.toArray(pending))
   };
 
   // Authenticated, globally throttled cleanup for tombstoned photos.
