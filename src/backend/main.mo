@@ -231,8 +231,21 @@ persistent actor {
     }
   };
 
-  // Stage 1: only the Wander object owner can request a photo grant.
-  // Public/guest check-in uploads need a separate abuse-resistant authorization path.
+  // Owners can upload object photos; authenticated participants can upload photos
+  // only after creating their own public Wander Checkpoint.
+  private func canUploadWanderPhoto(objectId : Text, user : Principal) : Bool {
+    switch (objectTrack(objectId)) {
+      case null false;
+      case (?item) {
+        if (item.createdBy == user) return true;
+        for (cp in List.toIter(checkpoints)) {
+          if (cp.trackId == objectId and cp.createdBy == user and cp.isPublic and
+              Text.startsWith(cp.note, #text guestCheckpointPrefix)) return true;
+        };
+        false
+      };
+    }
+  };
   // Persist grant throttle across upgrades. Reserve before the cross-canister
   // await so concurrent requests cannot bypass the per-user limit.
   private var wanderPhotoGrantAttempts : [(Principal, Int)] = [];
@@ -320,7 +333,7 @@ persistent actor {
     switch (objectTrack(objectId)) {
       case null { return #err("Wander object not found") };
       case (?item) {
-        if (item.createdBy != caller) return #err("Only the object owner can upload in this phase");
+        if (not canUploadWanderPhoto(objectId, caller)) return #err("Create your own Checkpoint before uploading photos");
       };
     };
     if (size == 0 or size > 10_485_760) return #err("Invalid photo size");
@@ -370,7 +383,7 @@ persistent actor {
     switch (objectTrack(objectId)) {
       case null { return #err("Wander object not found") };
       case (?item) {
-        if (item.createdBy != caller) return #err("Only the object owner may verify uploads");
+        if (not canUploadWanderPhoto(objectId, caller)) return #err("Checkpoint photo authorization required");
       };
     };
     if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
@@ -385,8 +398,8 @@ persistent actor {
           switch (objectTrack(objectId)) {
             case null { return #err("Wander object no longer exists") };
             case (?current) {
-              if (current.createdBy != caller) {
-                return #err("Wander object ownership changed");
+              if (not canUploadWanderPhoto(objectId, caller)) {
+                return #err("Checkpoint photo authorization changed");
               };
             };
           };
@@ -417,7 +430,7 @@ persistent actor {
     switch (objectTrack(objectId)) {
       case null { return #err("Wander object not found") };
       case (?item) {
-        if (item.createdBy != caller) return #err("Only the object owner may prepare publication");
+        if (not canUploadWanderPhoto(objectId, caller)) return #err("Checkpoint photo authorization required");
       };
     };
     if (Text.size(storageObjectId) == 0 or Text.size(storageObjectId) > 256) {
@@ -442,7 +455,7 @@ persistent actor {
     switch (objectTrack(objectId)) {
       case null { return #err("Wander object no longer exists") };
       case (?current) {
-        if (current.createdBy != caller) return #err("Wander object ownership changed");
+        if (not canUploadWanderPhoto(objectId, caller)) return #err("Checkpoint photo authorization changed");
       };
     };
     // One ICEStorage object may not be assigned to multiple Wander objects.
@@ -495,7 +508,7 @@ persistent actor {
     switch (objectTrack(objectId)) {
       case null return #err("Wander object not found");
       case (?item) {
-        if (item.createdBy != caller) return #err("Only the object owner may publish");
+        if (not canUploadWanderPhoto(objectId, caller)) return #err("Checkpoint photo authorization required");
       };
     };
     var found = false;
@@ -539,7 +552,7 @@ persistent actor {
     // Revalidate ownership after the cross-canister await.
     let stillOwned = switch (objectTrack(objectId)) {
       case null false;
-      case (?item) item.createdBy == caller;
+      case (?item) canUploadWanderPhoto(objectId, caller);
     };
     // A failed/ambiguous response returns to pending. ICEStorage's publication
     // endpoint is idempotent, so the next call safely reconciles lost replies.
@@ -874,7 +887,7 @@ persistent actor {
     switch (objectTrack(objectId)) {
       case null return #err("Wander object not found");
       case (?item) {
-        if (item.createdBy != caller) return #err("Only the object owner may bind photos");
+        if (item.createdBy != caller and author != caller) return #err("Only your own Checkpoint may receive this photo");
       };
     };
     let matching = List.filter<Types.CheckPoint>(checkpoints, func(cp) {
@@ -883,6 +896,7 @@ persistent actor {
       Text.startsWith(cp.note, #text guestCheckpointPrefix)
     });
     if (List.size(matching) != 1) return #err("Checkpoint not found or ambiguous");
+    if (not canUploadWanderPhoto(objectId, caller)) return #err("Checkpoint photo authorization required");
     let published = Array.find<WanderPhotoPublicationIntent>(
       wanderPhotoPublicationIntents,
       func(intent) {
@@ -1224,96 +1238,15 @@ persistent actor {
     ?out
   };
 
+  // Legacy gateway API retained for Candid/upgrade compatibility.
+  // Guests are read-only: no relay, including a previously authorized one,
+  // may create Checkpoints on behalf of anonymous visitors.
   public shared ({ caller }) func submitGuestCheckin(
     input : GuestCheckinInput
   ) : async Result.Result<Nat, GuestCheckinError> {
-    // The calling Principal is the server relay, not an anonymous visitor.
-    let policy = switch (guestPolicy(input.objectId)) {
-      case null { return #err(#disabled) };
-      case (?value) { value };
-    };
-    if (caller != policy.0) return #err(#unauthorized);
-    if (not policy.1) return #err(#disabled);
-    switch (objectTrack(input.objectId)) {
-      case null { return #err(#notFound) };
-      case (?_) {};
-    };
-    if (not (input.latitude >= -90.0 and input.latitude <= 90.0) or
-        not (input.longitude >= -180.0 and input.longitude <= 180.0) or
-        input.accuracyMeters > 2000 or Text.size(input.note) > 280 or
-        Array.size(Blob.toArray(Text.encodeUtf8(input.note))) > 1200 or
-        Text.size(input.requestId) != 36) {
-      return #err(#invalid);
-    };
-    let safeNote = switch (escapeGuestNote(input.note)) {
-      case null { return #err(#invalid) };
-      case (?text) { text };
-    };
-    for ((storedObject, storedRequest, _) in guestRequestReceipts.vals()) {
-      if (storedObject == input.objectId and storedRequest == input.requestId) {
-        return #err(#duplicate);
-      };
-    };
-    let now = Time.now();
-    let day = now / guestDayNs;
-    var count : Nat = 0;
-    var lastAt : Int = 0;
-    for ((objectId, usageDay, dailyCount, lastTime) in guestDailyUsage.vals()) {
-      if (objectId == input.objectId and usageDay == day) {
-        count := dailyCount;
-        lastAt := lastTime;
-      };
-    };
-    if (count >= guestDailyLimit or
-        (lastAt > 0 and now - lastAt < guestMinimumGapNs)) {
-      return #err(#rateLimited);
-    };
-    let actionText = switch (input.action) {
-      case (#found) { "found" };
-      case (#carried) { "carried" };
-      case (#left) { "left" };
-    };
-    let storedNote = if (objectCommentsEnabled(input.objectId)) { safeNote } else { "" };
-    let noteJson = "{\"action\":\"" # actionText #
-      "\",\"accuracyMeters\":" # Nat.toText(input.accuracyMeters) #
-      ",\"note\":\"" # storedNote # "\"}";
-    let cp : Types.CheckPoint = {
-      trackId = input.objectId;
-      groupId = null;
-      latitude = roundPublicCoordinate(input.latitude);
-      longitude = roundPublicCoordinate(input.longitude);
-      elevation = 0.0;
-      note = guestCheckpointPrefix # noteJson;
-      photo = null;
-      timestamp = now;
-      isPublic = true;
-      createdBy = caller;
-    };
-    // Atomic in one update: there is no await between checks and all writes.
-    guestDailyUsage := Array.append<(Text, Int, Nat, Int)>(
-      Array.filter<(Text, Int, Nat, Int)>(
-        guestDailyUsage,
-        func(u) { u.1 == day and u.0 != input.objectId }
-      ),
-      [(input.objectId, day, count + 1, now)]
-    );
-    let recent = Array.filter<(Text, Text, Int)>(
-      guestRequestReceipts,
-      func(r) { now - r.2 < 7 * guestDayNs }
-    );
-    let keep = if (recent.size() >= guestMaxReceipts) {
-      let offset = recent.size() - guestMaxReceipts + 1;
-      Array.tabulate<(Text, Text, Int)>(
-        recent.size() - offset,
-        func(i) { recent[i + offset] }
-      )
-    } else { recent };
-    guestRequestReceipts := Array.append<(Text, Text, Int)>(
-      keep, [(input.objectId, input.requestId, now)]
-    );
-    checkpoints := List.push<Types.CheckPoint>(cp, checkpoints);
-    indexPublicCheckpoint(cp);
-    #ok(1)
+    ignore caller;
+    ignore input;
+    #err(#disabled)
   };
 
   //==========================================================
@@ -1358,6 +1291,8 @@ persistent actor {
       createdBy = msg.caller;
     };
     checkpoints := List.push(cp, checkpoints);
+    // Keep the public per-track query index consistent with durable writes.
+    indexPublicCheckpoint(cp);
     #ok(1);
   };
 
