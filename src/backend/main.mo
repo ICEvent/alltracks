@@ -539,7 +539,6 @@ persistent actor {
           }
         } catch (_) { false };
         if (deleted) {
-          cleanupSucceeded := true;
           wanderPhotoPublicationIntents := Array.map<WanderPhotoPublicationIntent, WanderPhotoPublicationIntent>(
             wanderPhotoPublicationIntents,
             func(intent) {
