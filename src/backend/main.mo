@@ -1238,96 +1238,15 @@ persistent actor {
     ?out
   };
 
+  // Legacy gateway API retained for Candid/upgrade compatibility.
+  // Guests are read-only: no relay, including a previously authorized one,
+  // may create Checkpoints on behalf of anonymous visitors.
   public shared ({ caller }) func submitGuestCheckin(
     input : GuestCheckinInput
   ) : async Result.Result<Nat, GuestCheckinError> {
-    // The calling Principal is the server relay, not an anonymous visitor.
-    let policy = switch (guestPolicy(input.objectId)) {
-      case null { return #err(#disabled) };
-      case (?value) { value };
-    };
-    if (caller != policy.0) return #err(#unauthorized);
-    if (not policy.1) return #err(#disabled);
-    switch (objectTrack(input.objectId)) {
-      case null { return #err(#notFound) };
-      case (?_) {};
-    };
-    if (not (input.latitude >= -90.0 and input.latitude <= 90.0) or
-        not (input.longitude >= -180.0 and input.longitude <= 180.0) or
-        input.accuracyMeters > 2000 or Text.size(input.note) > 280 or
-        Array.size(Blob.toArray(Text.encodeUtf8(input.note))) > 1200 or
-        Text.size(input.requestId) != 36) {
-      return #err(#invalid);
-    };
-    let safeNote = switch (escapeGuestNote(input.note)) {
-      case null { return #err(#invalid) };
-      case (?text) { text };
-    };
-    for ((storedObject, storedRequest, _) in guestRequestReceipts.vals()) {
-      if (storedObject == input.objectId and storedRequest == input.requestId) {
-        return #err(#duplicate);
-      };
-    };
-    let now = Time.now();
-    let day = now / guestDayNs;
-    var count : Nat = 0;
-    var lastAt : Int = 0;
-    for ((objectId, usageDay, dailyCount, lastTime) in guestDailyUsage.vals()) {
-      if (objectId == input.objectId and usageDay == day) {
-        count := dailyCount;
-        lastAt := lastTime;
-      };
-    };
-    if (count >= guestDailyLimit or
-        (lastAt > 0 and now - lastAt < guestMinimumGapNs)) {
-      return #err(#rateLimited);
-    };
-    let actionText = switch (input.action) {
-      case (#found) { "found" };
-      case (#carried) { "carried" };
-      case (#left) { "left" };
-    };
-    let storedNote = if (objectCommentsEnabled(input.objectId)) { safeNote } else { "" };
-    let noteJson = "{\"action\":\"" # actionText #
-      "\",\"accuracyMeters\":" # Nat.toText(input.accuracyMeters) #
-      ",\"note\":\"" # storedNote # "\"}";
-    let cp : Types.CheckPoint = {
-      trackId = input.objectId;
-      groupId = null;
-      latitude = roundPublicCoordinate(input.latitude);
-      longitude = roundPublicCoordinate(input.longitude);
-      elevation = 0.0;
-      note = guestCheckpointPrefix # noteJson;
-      photo = null;
-      timestamp = now;
-      isPublic = true;
-      createdBy = caller;
-    };
-    // Atomic in one update: there is no await between checks and all writes.
-    guestDailyUsage := Array.append<(Text, Int, Nat, Int)>(
-      Array.filter<(Text, Int, Nat, Int)>(
-        guestDailyUsage,
-        func(u) { u.1 == day and u.0 != input.objectId }
-      ),
-      [(input.objectId, day, count + 1, now)]
-    );
-    let recent = Array.filter<(Text, Text, Int)>(
-      guestRequestReceipts,
-      func(r) { now - r.2 < 7 * guestDayNs }
-    );
-    let keep = if (recent.size() >= guestMaxReceipts) {
-      let offset = recent.size() - guestMaxReceipts + 1;
-      Array.tabulate<(Text, Text, Int)>(
-        recent.size() - offset,
-        func(i) { recent[i + offset] }
-      )
-    } else { recent };
-    guestRequestReceipts := Array.append<(Text, Text, Int)>(
-      keep, [(input.objectId, input.requestId, now)]
-    );
-    checkpoints := List.push<Types.CheckPoint>(cp, checkpoints);
-    indexPublicCheckpoint(cp);
-    #ok(1)
+    ignore caller;
+    ignore input;
+    #err(#disabled)
   };
 
   //==========================================================
