@@ -109,13 +109,15 @@ persistent actor {
   };
 
   system func postupgrade() {
-    // Rebuild in reverse insertion order so per-track query order matches
-    // the original newest-first List traversal after an upgrade.
-    let restoredCheckpoints = List.toArray(checkpoints);
-    var checkpointIndex = restoredCheckpoints.size();
-    while (checkpointIndex > 0) {
-      checkpointIndex -= 1;
-      indexPublicCheckpoint(restoredCheckpoints[checkpointIndex]);
+    // Avoid materializing the entire durable checkpoint list as an array
+    // during upgrade (which can trigger a large transient heap allocation).
+    // First build reversed per-track lists, then reverse each bucket once
+    // to preserve the original newest-first query order.
+    for (cp in List.toIter(checkpoints)) {
+      indexPublicCheckpoint(cp);
+    };
+    for ((trackId, reversed) in publicCheckpointsByTrack.entries()) {
+      publicCheckpointsByTrack.put(trackId, List.reverse(reversed));
     };
     // Preserve List.find's first-match behavior for legacy duplicate IDs.
     for (track in List.toArray(tracks).vals()) {
