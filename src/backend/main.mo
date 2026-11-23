@@ -1291,6 +1291,8 @@ persistent actor {
       createdBy = msg.caller;
     };
     checkpoints := List.push(cp, checkpoints);
+    // Keep the public per-track query index consistent with durable writes.
+    indexPublicCheckpoint(cp);
     #ok(1);
   };
 
