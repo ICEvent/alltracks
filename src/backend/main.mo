@@ -1481,23 +1481,23 @@ persistent actor {
   };
 
   public query func getCheckpoints(filter : CheckpointFilter, startime : Time.Time, endtime : Time.Time) : async [Types.CheckPoint] {
-    let filtered = List.filter<Types.CheckPoint>(
-      checkpoints,
-      func(cp : Types.CheckPoint) : Bool {
-        let timeInRange = cp.timestamp >= startime and cp.timestamp <= endtime;
-        let matchesFilter = switch (filter) {
-          case (#user(principal)) { cp.createdBy == principal };
-          case (#groupId(gid)) {
-            switch (cp.groupId) {
-              case (?groupId) { groupId == gid };
-              case (null) { false };
-            };
+    let result = Buffer.Buffer<Types.CheckPoint>(0);
+    for (cp in List.toIter(checkpoints)) {
+      let timeInRange = cp.timestamp >= startime and cp.timestamp <= endtime;
+      let matchesFilter = switch (filter) {
+        case (#user(principal)) { cp.createdBy == principal };
+        case (#groupId(gid)) {
+          switch (cp.groupId) {
+            case (?groupId) { groupId == gid };
+            case null { false };
           };
         };
-        timeInRange and matchesFilter and cp.isPublic;
-      },
-    );
-    List.toArray(filtered);
+      };
+      if (timeInRange and matchesFilter and cp.isPublic) {
+        result.add(cp);
+      };
+    };
+    Buffer.toArray(result);
   };
 
   public query func getLatestCheckpoints() : async [Types.CheckPoint] {
@@ -1933,33 +1933,28 @@ persistent actor {
   // Pagination: page is zero-based. pageSize == 0 returns an empty list.
   public query func getTracks(filter : TrackFilter, page : Nat, pageSize : Nat) : async [Types.Track] {
     if (pageSize == 0) { [] } else {
-      let filteredArr = List.toArray(List.filter<Types.Track>(
-        tracks,
-        func(track : Types.Track) : Bool {
-          switch (filter) {
-            case (#user(principal)) { track.createdBy == principal };
-            case (#group(groupId)) {
-              switch (track.groupId) {
-                case (?gid) { gid == groupId };
-                case null { false };
-              };
+      let start : Nat = page * pageSize;
+      let res = Buffer.Buffer<Types.Track>(0);
+      var matched : Nat = 0;
+      label scan for (track in List.toIter(tracks)) {
+        let matches = switch (filter) {
+          case (#user(principal)) { track.createdBy == principal };
+          case (#group(groupId)) {
+            switch (track.groupId) {
+              case (?gid) { gid == groupId };
+              case null { false };
             };
           };
-        },
-      ));
-      let total = Array.size(filteredArr);
-      let start : Nat = page * pageSize;
-      if (start >= total) { [] } else {
-        let res = Buffer.Buffer<Types.Track>(0);
-        var i : Nat = start;
-        var taken : Nat = 0;
-        while (i < total and taken < pageSize) {
-          res.add(filteredArr[i]);
-          i += 1;
-          taken += 1;
         };
-        Buffer.toArray(res);
+        if (matches) {
+          if (matched >= start) {
+            res.add(track);
+            if (res.size() >= pageSize) break scan;
+          };
+          matched += 1;
+        };
       };
+      Buffer.toArray(res);
     };
   };
 
