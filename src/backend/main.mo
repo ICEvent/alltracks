@@ -1135,15 +1135,36 @@ persistent actor {
              binding.author == author)
       },
     );
-    checkpoints := List.filter<Types.CheckPoint>(
-      checkpoints, func(cp) {
-        not (
-          cp.trackId == objectId and cp.timestamp == timestamp and
-          cp.createdBy == author and cp.isPublic and
-          Text.startsWith(cp.note, #text guestCheckpointPrefix)
-        )
-      }
-    );
+    // Remove the one verified record without rebuilding the entire list.
+    // Retain the untouched suffix by structural sharing: allocation is
+    // proportional to the prefix before the deleted checkpoint, not N.
+    let prefix = Buffer.Buffer<Types.CheckPoint>(0);
+    var suffix = checkpoints;
+    var removed = false;
+    label findCheckpoint while (not removed) {
+      switch (suffix) {
+        case null { break findCheckpoint };
+        case (?(cp, rest)) {
+          if (cp.trackId == objectId and cp.timestamp == timestamp and
+              cp.createdBy == author and cp.isPublic and
+              Text.startsWith(cp.note, #text guestCheckpointPrefix)) {
+            suffix := rest;
+            removed := true;
+          } else {
+            prefix.add(cp);
+            suffix := rest;
+          };
+        };
+      };
+    };
+    // The earlier uniqueness check guarantees that a match exists.
+    // Rebuild only the traversed prefix, in reverse, onto the shared tail.
+    var prefixIndex = prefix.size();
+    while (prefixIndex > 0) {
+      prefixIndex -= 1;
+      suffix := List.push(prefix.get(prefixIndex), suffix);
+    };
+    checkpoints := suffix;
     // The deletion above removes exactly one matching public checkpoint.
     // Update only its track index rather than rebuilding all track indexes.
     switch (publicCheckpointsByTrack.get(objectId)) {
