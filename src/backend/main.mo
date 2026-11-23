@@ -35,6 +35,21 @@ persistent actor {
   private  var checkpointComments : List.List<Types.CheckpointComment> = List.nil();
 
   private  var checkpoints : List.List<Types.CheckPoint> = List.nil();
+  // Transient, public-only track index. Stores references to existing records,
+  // not copies of photo bytes; durable checkpoints remain the source of truth.
+  private transient var publicCheckpointsByTrack =
+    HashMap.HashMap<Text, List.List<Types.CheckPoint>>(1, Text.equal, Text.hash);
+
+  private func indexPublicCheckpoint(cp : Types.CheckPoint) {
+    if (cp.isPublic) {
+      let existing = switch (publicCheckpointsByTrack.get(cp.trackId)) {
+        case (?items) items;
+        case null List.nil<Types.CheckPoint>();
+      };
+      publicCheckpointsByTrack.put(cp.trackId, List.push(cp, existing));
+    };
+  };
+
   private  var incidentPoints : List.List<Types.IncidentPoint> = List.nil();
   private  var userCredentialsEntries : [(Principal, Types.UserCredential)] = [];
   // Additive stable fields: compatible with the existing Track/Checkpoint model.
@@ -94,6 +109,14 @@ persistent actor {
   };
 
   system func postupgrade() {
+    // Rebuild in reverse insertion order so per-track query order matches
+    // the original newest-first List traversal after an upgrade.
+    let restoredCheckpoints = List.toArray(checkpoints);
+    var checkpointIndex = restoredCheckpoints.size();
+    while (checkpointIndex > 0) {
+      checkpointIndex -= 1;
+      indexPublicCheckpoint(restoredCheckpoints[checkpointIndex]);
+    };
     // Preserve List.find's first-match behavior for legacy duplicate IDs.
     for (track in List.toArray(tracks).vals()) {
       if (tracksById.get(track.id) == null) tracksById.put(track.id, track);
@@ -1111,6 +1134,19 @@ persistent actor {
         )
       }
     );
+    // The deletion above removes exactly one matching public checkpoint.
+    // Update only its track index rather than rebuilding all track indexes.
+    switch (publicCheckpointsByTrack.get(objectId)) {
+      case (?items) {
+        publicCheckpointsByTrack.put(objectId, List.filter<Types.CheckPoint>(
+          items, func(cp) {
+            not (cp.timestamp == timestamp and cp.createdBy == author and
+              Text.startsWith(cp.note, #text guestCheckpointPrefix))
+          },
+        ));
+      };
+      case null {};
+    };
     // Attempt ICEStorage revocation immediately after the durable tombstone.
     // A failed remote call never restores the deleted Checkpoint. Its
     // #revoking intent remains available for authenticated reconciliation.
@@ -1285,6 +1321,7 @@ persistent actor {
       keep, [(input.objectId, input.requestId, now)]
     );
     checkpoints := List.push<Types.CheckPoint>(cp, checkpoints);
+    indexPublicCheckpoint(cp);
     #ok(1)
   };
 
@@ -1339,13 +1376,10 @@ persistent actor {
   };
 
   public query func getCheckPointsByTrackId(trackId : Text) : async [Types.CheckPoint] {
-    let filtered = List.filter<Types.CheckPoint>(
-      checkpoints,
-      func(cp : Types.CheckPoint) : Bool {
-        cp.trackId == trackId and cp.isPublic;
-      },
-    );
-    List.toArray(filtered);
+    switch (publicCheckpointsByTrack.get(trackId)) {
+      case (?items) List.toArray(items);
+      case null [];
+    };
   };
 
   public query func getCheckpoints(filter : CheckpointFilter, startime : Time.Time, endtime : Time.Time) : async [Types.CheckPoint] {
