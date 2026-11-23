@@ -1052,16 +1052,18 @@ persistent actor {
       case (?item) { item.createdBy };
     };
     if (caller != owner and caller != author) return #err("Not authorized");
-    let matching = List.filter<Types.CheckPoint>(
-      checkpoints, func(cp) {
-        cp.trackId == objectId and cp.timestamp == timestamp and
-        cp.createdBy == author and cp.isPublic and
-        Text.startsWith(cp.note, #text guestCheckpointPrefix)
-      }
-    );
-    // A legacy Track checkpoint isn't eligible, and ambiguous IDs must fail
-    // closed rather than deleting multiple checkpoints.
-    if (List.size(matching) != 1) return #err("Object check-in not found or ambiguous");
+    // Count matching checkpoints without allocating a duplicate linked list.
+    // Ambiguous legacy records still fail closed.
+    var matchingCount : Nat = 0;
+    for (cp in List.toIter(checkpoints)) {
+      if (cp.trackId == objectId and cp.timestamp == timestamp and
+          cp.createdBy == author and cp.isPublic and
+          Text.startsWith(cp.note, #text guestCheckpointPrefix)) {
+        matchingCount += 1;
+        if (matchingCount > 1) return #err("Object check-in not found or ambiguous");
+      };
+    };
+    if (matchingCount != 1) return #err("Object check-in not found or ambiguous");
     // Hide linked photos before removing the Checkpoint. ICEStorage cleanup
     // remains retryable through deleteOwnedWanderPhoto; no external await here.
     let linked = Array.filter<WanderCheckpointPhotoBinding>(
