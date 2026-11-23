@@ -17,6 +17,7 @@ import Nat8 "mo:base/Nat8";
 
 import HashMap "mo:base/HashMap";
 import Prim "mo:prim";
+import Debug "mo:base/Debug";
 
 persistent actor {
   private  var nextTrailId : Nat = 1;
@@ -411,11 +412,22 @@ persistent actor {
     })
   };
 
+  // Temporary production diagnostics. No object IDs, principals, or grant tokens in logs.
+  private func logWanderGrantStage(stage : Text) {
+    Debug.print(
+      "[wander-photo-grant] " # stage #
+      " heap=" # Nat.toText(Prim.rts_heap_size()) #
+      " wasm=" # Nat.toText(Prim.rts_memory_size()) #
+      " attempts=" # Nat.toText(wanderPhotoGrantAttempts.size())
+    );
+  };
+
   public shared ({ caller }) func requestWanderPhotoUploadGrant(
     objectId : Text,
     mimeType : Text,
     size : Nat,
   ) : async Result.Result<Text, Text> {
+    logWanderGrantStage("entry");
     if (Principal.isAnonymous(caller)) return #err("Login required");
     switch (objectTrack(objectId)) {
       case null { return #err("Wander object not found") };
@@ -427,6 +439,7 @@ persistent actor {
     if (mimeType != "image/jpeg" and mimeType != "image/png" and
         mimeType != "image/webp") return #err("Unsupported photo type");
 
+    logWanderGrantStage("validated");
     let now = Time.now();
     // Drop old reservations and enforce a bounded stable table.
     // Reject throttled callers before allocating a filtered replacement table.
@@ -442,6 +455,7 @@ persistent actor {
     if (retainedCount >= wanderPhotoGrantMaxEntries) {
       return #err("Photo upload authorization is temporarily busy");
     };
+    logWanderGrantStage("before-reservation");
     // One bounded allocation rather than Array.filter followed by Array.append.
     let recent = Buffer.Buffer<(Principal, Int)>(retainedCount + 1);
     for (entry in wanderPhotoGrantAttempts.vals()) {
@@ -451,15 +465,23 @@ persistent actor {
     };
     recent.add((caller, now));
     wanderPhotoGrantAttempts := Buffer.toArray(recent);
+    logWanderGrantStage("after-reservation-before-await");
 
     try {
       switch (await wanderStorage.issueProjectUploadGrant(
         caller, objectId, mimeType, size, null,
       )) {
-        case (#ok(grantId)) { #ok(grantId) };
-        case (#err(message)) { #err(message) };
+        case (#ok(grantId)) {
+          logWanderGrantStage("after-await-ok");
+          #ok(grantId)
+        };
+        case (#err(message)) {
+          logWanderGrantStage("after-await-error");
+          #err(message)
+        };
       }
     } catch (_) {
+      logWanderGrantStage("after-await-catch");
       #err("Photo authorization service unavailable")
     }
   };
